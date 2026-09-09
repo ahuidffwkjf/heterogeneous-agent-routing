@@ -1,5 +1,7 @@
 # 异构 Agent Router：DeepSeek Harness + MicroVM
 
+> 当前版本：控制面原型 v0.2（DSH Harness、MicroVM Pool、动态注册与故障恢复）
+
 这是一个面向异构 Agent Harness 的实验原型。当前主线聚焦于：用户提交自然语言任务，Controller 监听任务和状态，Router 自动选择合适的 DeepSeek Harness，MicroVM Pool 为 Harness 提供一次性隔离执行环境。
 
 不同 Harness 使用同一个 DSH 运行时，但可以安装不同插件、声明不同工具和能力。Harness 内部如何发现 Agent、是否组建 Agent Team 以及如何协作，对全局 Router 和用户都是隐藏的。
@@ -34,6 +36,8 @@ flowchart LR
 ```
 
 主目录只保留当前 DSH + MicroVM 主线。Mac/iPhone 是早期概念验证，已单独放入 [`archive/early_mac_iphone/`](archive/early_mac_iphone/)，实验过程见 [`reports/early_mac_iphone_experiment.md`](reports/early_mac_iphone_experiment.md)。
+
+新的分层架构图见 [`docs/architecture_v2.md`](docs/architecture_v2.md)，其中分别展示控制面、执行面、隔离层和故障恢复路径。
 
 ## 核心流程
 
@@ -253,3 +257,7 @@ python3 -m unittest -v \
 3. 接入真实 MicroVM Backend 和共享快照存储；
 4. 引入 World Model，预测任务需求、Harness 成功率、延迟和资源状态；
 5. 在多节点和故障注入场景下进行正式对比实验。
+
+## 当前版本边界
+
+当前版本已经可以在本地或 ECS 上验证 Router、Controller、Registry 和 MicroVM Pool 的协调关系，但 MicroVM 仍由 Mock Backend 表示，DSH Adapter 也需要单独启动。真实 KVM/CubeSandbox 接入、共享对象存储和 World Model 预测属于后续实验阶段。
