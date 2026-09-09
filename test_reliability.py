@@ -3,13 +3,14 @@ import time
 import unittest
 from pathlib import Path
 
-from phase1_mac_iphone import PhaseOneController
+from controller import PhaseOneController
 
 
 class ReliabilityTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.controller = PhaseOneController(
+            registry_path=Path(__file__).with_name("test_execution_units.json"),
             database_path=Path(self.temp_dir.name) / "registry.db",
             heartbeat_timeout=0.2,
             monitor_interval=0.05,
@@ -69,6 +70,7 @@ class ReliabilityTests(unittest.TestCase):
         database_path = Path(self.temp_dir.name) / "registry.db"
         self.controller.close()
         self.controller = PhaseOneController(
+            registry_path=Path(__file__).with_name("test_execution_units.json"),
             database_path=database_path,
             heartbeat_timeout=0.2,
             monitor_interval=0.05,

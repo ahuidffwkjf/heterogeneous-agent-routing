@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from microvm_pool import MicroVMNode, MicroVMPoolManager
-from phase1_mac_iphone import PhaseOneController
+from controller import PhaseOneController
 
 
 class MicroVMPoolTests(unittest.TestCase):
@@ -31,6 +31,7 @@ class MicroVMPoolTests(unittest.TestCase):
     def test_controller_assigns_and_releases_microvm(self):
         with tempfile.TemporaryDirectory() as directory:
             controller = PhaseOneController(
+                registry_path=Path(__file__).with_name("test_execution_units.json"),
                 database_path=Path(directory) / "registry.db",
                 microvm_pool_size=3,
             )

@@ -315,9 +315,9 @@ def demo_router() -> Router:
     return Router(
         [
             ExecutionUnit(
-                unit_id="mac_agent_01",
-                unit_type="single_agent",
-                platforms={"macos"},
+                unit_id="dsh_harness_file_demo",
+                unit_type="harness",
+                platforms={"linux"},
                 capabilities={"code_build", "document_generation"},
                 tools={"xcode", "python"},
                 success_rate=0.92,
@@ -326,8 +326,8 @@ def demo_router() -> Router:
                 cost_score=0.35,
             ),
             ExecutionUnit(
-                unit_id="linux_agent_01",
-                unit_type="single_agent",
+                unit_id="dsh_harness_code_demo",
+                unit_type="harness",
                 platforms={"linux"},
                 capabilities={"code_build", "document_generation", "python"},
                 tools={"python", "docker"},
@@ -338,8 +338,8 @@ def demo_router() -> Router:
                 cost_score=0.25,
             ),
             ExecutionUnit(
-                unit_id="gpu_team_01",
-                unit_type="agent_team",
+                unit_id="dsh_harness_gpu_demo",
+                unit_type="harness",
                 platforms={"linux"},
                 capabilities={"gpu", "parallel_compute", "image_inference", "python"},
                 tools={"cuda", "python"},

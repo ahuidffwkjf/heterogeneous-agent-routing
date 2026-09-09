@@ -1,0 +1,26 @@
+{
+  "units": [
+    {
+      "unit_id": "dsh_test_mobile_01",
+      "unit_type": "harness",
+      "platforms": ["ios"],
+      "capabilities": ["mobile", "camera"],
+      "tools": ["dsh"],
+      "state": "idle",
+      "load": 0.0,
+      "metadata": {"transport": "poll", "harness_type": "test_dsh"},
+      "heartbeat_required": false
+    },
+    {
+      "unit_id": "dsh_test_mobile_02",
+      "unit_type": "harness",
+      "platforms": ["ios"],
+      "capabilities": ["mobile", "camera"],
+      "tools": ["dsh"],
+      "state": "idle",
+      "load": 0.1,
+      "metadata": {"transport": "poll", "harness_type": "test_dsh"},
+      "heartbeat_required": false
+    }
+  ]
+}

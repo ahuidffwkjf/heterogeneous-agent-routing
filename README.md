@@ -1,175 +1,80 @@
 # 异构 Agent Router：DeepSeek Harness + MicroVM
 
-这是一个面向异构 Agent Harness 的实验原型。当前主线是：在 ECS 上运行 Controller、Router、Registry 和 MicroVM Pool，在每个隔离执行环境内运行统一的 DeepSeek Harness，并通过插件、权限、数据位置和资源状态形成能力差异。
+这是一个面向异构 Agent Harness 的实验原型。当前主线聚焦于：用户提交自然语言任务，Controller 监听任务和状态，Router 自动选择合适的 DeepSeek Harness，MicroVM Pool 为 Harness 提供一次性隔离执行环境。
 
-系统由 Controller、TaskRouter、动态 Harness Registry、DSH Adapter、Harness Runtime 和 MicroVM Warm Pool 组成。全局 Router 根据任务语义、能力、工具、硬件和在线状态选择 Harness；Harness 自己发现内部 Agent，并按任务需求组建 Agent Team。用户和全局 Router 不需要知道 Team 内部如何分工。
+不同 Harness 使用同一个 DSH 运行时，但可以安装不同插件、声明不同工具和能力。Harness 内部如何发现 Agent、是否组建 Agent Team 以及如何协作，对全局 Router 和用户都是隐藏的。
 
-## 项目结构图
+## 当前结构
 
 ```mermaid
 flowchart LR
     U["用户任务"] --> C["Controller\n任务生命周期与故障恢复"]
-
-    C --> R["Router / TaskParser\n能力解析与自动路由"]
-    C --> REG["Registry\nSQLite：能力、硬件、心跳、状态"]
-    C --> JOB["Job Store\n任务状态、租约、失败历史"]
-    C --> OPS["Operations API\n节点隔离、排空、恢复"]
+    C --> R["Router / TaskParser\n需求推断与自动路由"]
+    C --> REG["Registry\nSQLite：能力、硬件、心跳"]
+    C --> JOB["Job Store\n状态、租约、失败历史"]
     C --> P["MicroVM Pool\n预热、租用、销毁、补池"]
-
-    R --> H1["DSH Harness VM 1\n文件 / 文档插件"]
-    R --> H2["DSH Harness VM 2\n代码 / Python / 编译插件"]
-    R --> H3["DSH Harness VM 3\n数据处理 / 结构化输出插件"]
-
-    P --> N1["Node A\n资源与运行时版本"]
-    P --> N2["Node B\n资源与运行时版本"]
+    R --> H1["DSH Harness 1\n文件 / 文档插件"]
+    R --> H2["DSH Harness 2\n代码 / Python 插件"]
+    R --> H3["DSH Harness 3\n数据处理插件"]
+    P --> N1["Node A"]
+    P --> N2["Node B"]
     N1 --> H1
     N1 --> H2
     N2 --> H3
-
-    H1 --> A1["DSH Adapter\n注册、心跳、轮询、结果回传"]
+    H1 --> A1["DSH Adapter\n注册、心跳、轮询、执行"]
     H2 --> A2["DSH Adapter"]
     H3 --> A3["DSH Adapter"]
-    A1 -. "outbound polling" .-> C
-    A2 -. "outbound polling" .-> C
-    A3 -. "outbound polling" .-> C
-
-    P --> S["Shared Snapshot Store\npause / resume / 跨节点恢复"]
-    S --> N1
-    S --> N2
-
-    H1 -. "内部发现与组队，对外隐藏" .-> T1["Private Agent / Agent Team"]
-    H2 -. "内部发现与组队，对外隐藏" .-> T2["Private Agent / Agent Team"]
-    H3 -. "内部发现与组队，对外隐藏" .-> T3["Private Agent / Agent Team"]
+    A1 -. "主动轮询" .-> C
+    A2 -. "主动轮询" .-> C
+    A3 -. "主动轮询" .-> C
+    H1 -. "内部发现与组队，对外隐藏" .-> T1["Private Agent / Team"]
+    H2 -. "内部发现与组队，对外隐藏" .-> T2["Private Agent / Team"]
+    H3 -. "内部发现与组队，对外隐藏" .-> T3["Private Agent / Team"]
+    P --> S["Shared Snapshot Store\n快照与跨节点恢复"]
 ```
 
-当前研究边界是：全局 Router 只选择 DSH Harness 实例，不直接选择 Harness 内部 Agent；MicroVM Pool 负责隔离和生命周期，DSH 负责 Harness 内部工具、插件和 Agent 协作。
+主目录只保留当前 DSH + MicroVM 主线。Mac/iPhone 是早期概念验证，已单独放入 [`archive/early_mac_iphone/`](archive/early_mac_iphone/)，实验过程见 [`reports/early_mac_iphone_experiment.md`](reports/early_mac_iphone_experiment.md)。
 
-## 当前架构
+## 核心流程
 
 ```text
-用户任务
-   ↓
-Controller
-   ├── SQLite Registry：Agent 注册、硬件和心跳
-   ├── Job Store：任务状态和失败历史
-   ├── TaskRouter：任务解析与执行单元选择
-   ├── DSH Adapter：统一 DeepSeek Harness 的注册、轮询和执行
-   └── MicroVMPool：按 Harness Profile 管理预热 MicroVM
-           ↓
-    DSH Harness + Plugins
-           ↓
-    Harness 内部发现 Agent / Agent Team
+POST /tasks
+  → TaskParser 推断能力、工具、平台和资源需求
+  → Router 读取 Registry，过滤不满足硬约束的 Harness
+  → Controller 创建任务租约并从 MicroVM Pool 租用沙箱
+  → DSH Adapter 轮询任务，在 MicroVM 内运行 DSH
+  → Harness 自己发现 Agent / Agent Team 并完成内部协作
+  → 回传统一结果
+  → Controller 销毁任务 MicroVM，并补充预热池
 ```
 
-Controller 负责监听、调度、心跳检测和故障恢复；Router 只负责分析任务并选择 Harness；Harness Runtime 负责内部 Agent 发现、组队和协作。
-
-## Harness 内部自治
-
-全局 Router 只看到 Harness 的聚合能力：
-
-```text
-Hardware Node
-└── Harness
-    ├── Agent A
-    ├── Agent B
-    └── Agent Team
-        ├── Agent C
-        └── Agent D
-```
-
-任务到达 Harness 后，Harness 自己完成：
-
-```text
-发现内部 Agent
-→ 判断单 Agent 是否足够
-→ 必要时组建 Agent Team
-→ 决定并行、顺序和通信方式
-→ 执行并聚合结果
-→ 向 Controller 返回统一结果
-```
-
-内部成员信息不会通过公共 Registry API 返回给用户，但 Harness 可以保留内部轨迹用于调试、故障恢复和 World Model 训练。
+用户不能在任务请求中指定 `harness_id`、`selected_unit` 或 `agent_id`。执行单元由 Router 根据任务需求、硬件、工具、负载和在线状态自动选择。
 
 ## 主要文件
 
 | 文件 | 作用 |
 |---|---|
-| `phase1_mac_iphone.py` | Controller、任务 API、Registry API 和故障恢复 |
-| `router.py` | 自然语言任务解析和执行单元路由 |
-| `registry.py` | SQLite 动态 Agent Registry 和 Job Store |
-| `microvm_pool.py` | MicroVM 预热池、租用、销毁和补充 |
-| `microvm_nodes.json` | 多节点、运行时版本和资源容量的实验配置 |
-| `dsh_agent.py` | 在 MicroVM 内运行的 DeepSeek Harness 轮询适配器 |
-| `execution_units_dsh.json` | DSH Harness 实验执行单元配置 |
-| `harness_runtime.py` | Harness 内部 Agent 发现和 Agent Team 组建 |
-| `mac_agent.py` | Mac HTTP Agent |
-| `execution_units.json` | 初始执行单元配置 |
-| `MobileAgent/.../ContentView.swift` | iPhone 注册、心跳、轮询和结果回传 |
+| `controller.py` | Controller、任务 API、注册 API、心跳监视和故障恢复 |
+| `router.py` | TaskParser、硬约束过滤和执行单元评分 |
+| `registry.py` | SQLite Registry 和 Job Store |
+| `microvm_pool.py` | MicroVM 预热、租用、销毁、补池和快照语义 |
+| `microvm_nodes.json` | 逻辑节点、资源容量和运行时版本配置 |
+| `dsh_agent.py` | DSH Harness 的注册、心跳、轮询和执行适配器 |
+| `execution_units_dsh.json` | DSH Harness 能力、插件和 MicroVM Profile |
+| `test_router.py` | 路由和需求解析测试 |
+| `test_reliability.py` | 心跳、掉线、租约和重试测试 |
+| `test_microvm_pool.py` | MicroVM 池、节点和快照测试 |
+| `test_execution_units.json` | 测试专用的最小执行单元配置 |
+| `archive/early_mac_iphone/` | 早期 Mac/iPhone 原型归档 |
+| `reports/early_mac_iphone_experiment.md` | 早期实验报告 |
 
-运行时会生成 `registry.db`，其中保存执行单元和任务状态。
+运行后生成的 `registry.db`、令牌、日志和 MicroVM 快照不会提交到 Git。
 
-## CubeSandbox 风格的 MicroVM 生命周期
+## 本地 / ECS 启动
 
-当前 `microvm_pool.py` 已经按 CubeSandbox v0.7.0 的关键控制面逻辑实现了一个本地可重放版本。默认仍使用 `MockMicroVMBackend`，因此不会假装已经接入真实 KVM；以后只需要替换 Backend，即可对接 Firecracker、CubeSandbox 或其他 MicroVM 服务。
+### 1. 准备配置
 
-目前支持：
-
-- **节点感知分配**：根据节点状态、CPU、内存和运行时版本选择低负载节点；
-- **节点隔离与排空**：`isolated` 节点不再接收新沙箱，`draining` 节点用于节点下线实验；
-- **共享快照存储**：pause 后把内存、文件系统、网络状态写入共享快照目录；
-- **跨节点恢复**：同一个快照可以在兼容的其他节点上 resume，或创建新的 MicroVM；
-- **组件多版本共存**：快照携带 `runtime_version`，恢复时检查目标节点是否支持该版本；
-- **任务沙箱一次性生命周期**：任务成功或失败后销毁 MicroVM，并自动补充预热实例；
-- **控制面/运维接口分离**：任务仍由 Controller/Router 管理，节点和沙箱运维使用 `/ops/*` 接口。
-
-`microvm_nodes.json` 中的多个节点目前是同一台 ECS 上的逻辑节点，只用于验证调度、隔离、快照和恢复语义，不能当作多台物理机器的性能结果。真实跨主机迁移需要将 Backend 和快照存储替换为 KVM + CubeSandbox/Firecracker + S3/MinIO。
-
-启动多节点模拟实验：
-
-```bash
-python3 phase1_mac_iphone.py \
-  --host 0.0.0.0 \
-  --port 8081 \
-  --registry execution_units.json \
-  --database registry.db \
-  --registry-token "$REGISTRY_TOKEN" \
-  --microvm-pool-size 3 \
-  --microvm-max-total 8 \
-  --microvm-nodes microvm_nodes.json \
-  --microvm-snapshot-dir /opt/heterogeneous-agents/microvm_snapshots
-```
-
-查看节点和 MicroVM：
-
-```bash
-curl -H "X-Registry-Token: $REGISTRY_TOKEN" \
-  http://127.0.0.1:8081/ops/nodes
-
-curl -H "X-Registry-Token: $REGISTRY_TOKEN" \
-  http://127.0.0.1:8081/microvms
-```
-
-节点运维操作：
-
-```bash
-# 隔离节点：不再为新任务创建 MicroVM
-curl -X POST -H "X-Registry-Token: $REGISTRY_TOKEN" \
-  http://127.0.0.1:8081/ops/nodes/node-ecs-01/isolate
-
-# 排空节点：用于模拟节点下线
-curl -X POST -H "X-Registry-Token: $REGISTRY_TOKEN" \
-  http://127.0.0.1:8081/ops/nodes/node-ecs-01/drain
-
-# 恢复节点参与调度
-curl -X POST -H "X-Registry-Token: $REGISTRY_TOKEN" \
-  http://127.0.0.1:8081/ops/nodes/node-ecs-01/restore
-```
-
-当前仍未实现真实内存页、磁盘块和 TAP 网络设备的迁移；这些属于后续 KVM/CubeSandbox Backend 的职责。
-
-## ECS 上的 DSH MicroVM 实验
-
-当前实验使用三个统一的 DeepSeek Harness 执行单元。它们不是三种不同 Harness，而是同一 DSH 运行时的不同插件/能力配置：
+当前配置中的三个执行单元都是统一的 DeepSeek Harness，只通过插件和能力产生差异：
 
 ```text
 dsh_harness_01 → 文件、文档、Python
@@ -177,10 +82,17 @@ dsh_harness_02 → Shell、Python、代码构建
 dsh_harness_03 → 数据处理、结构化抽取、Python
 ```
 
-使用 DSH 配置启动 Controller：
+在 ECS 项目目录中：
 
 ```bash
-python3 -u phase1_mac_iphone.py \
+cd /opt/heterogeneous-agents
+export REGISTRY_TOKEN="$(cat /root/registry_token)"
+```
+
+### 2. 启动 Controller
+
+```bash
+python3 -u controller.py \
   --host 0.0.0.0 \
   --port 8081 \
   --registry execution_units_dsh.json \
@@ -192,7 +104,19 @@ python3 -u phase1_mac_iphone.py \
   --microvm-snapshot-dir /opt/heterogeneous-agents/microvm_snapshots
 ```
 
-每个 DSH Harness 进程应在自己的 MicroVM 内运行：
+检查服务：
+
+```bash
+curl http://127.0.0.1:8081/health
+curl -H "X-Registry-Token: $REGISTRY_TOKEN" \
+  http://127.0.0.1:8081/registry/units
+curl -H "X-Registry-Token: $REGISTRY_TOKEN" \
+  http://127.0.0.1:8081/microvms
+```
+
+### 3. 启动 DSH Adapter
+
+每个 Harness 应在自己的 MicroVM 中运行一个 Adapter。下面是文件/文档 Harness 的示例：
 
 ```bash
 python3 dsh_agent.py \
@@ -210,265 +134,122 @@ python3 dsh_agent.py \
   --workspace /workspace
 ```
 
-`dsh_agent.py` 只向 Controller 暴露 Harness 的聚合能力，不暴露 DSH 内部 Agent 和 Agent Team。当前默认 Backend 仍是 Mock；确认 ECS 存在 `/dev/kvm` 后，再接入真实 CubeSandbox/Firecracker Backend。
-
-## 启动 Controller
-
-在项目目录执行：
+Adapter 使用 DSH 官方 headless 调用形式：
 
 ```bash
-cd "/Users/reveriephobia/Desktop/异构多智能体"
-
-python3 phase1_mac_iphone.py \
-  --host 0.0.0.0 \
-  --port 8081 \
-  --registry-token dev-token \
-  --microvm-pool-size 3 \
-  --microvm-max-total 8
+dsh --profile headless "任务描述"
 ```
 
-参数说明：
+如果要模拟三个 Harness，可以分别启动三个 Adapter，并使用各自的 `--unit-id`、能力和插件参数。当前 `microvm_pool.py` 默认是 `MockMicroVMBackend`，用于先验证控制面，不会创建真实 KVM 虚拟机。
 
-- `--registry-token`：Agent 注册和心跳所需的令牌；不要在真实网络中使用公开的简单令牌。
-- `--microvm-pool-size`：每种 MicroVM Profile 保持的预热实例数量，默认 3。
-- `--microvm-max-total`：高并发时某个 Profile 的最大实例数量，默认 8。
-- `--heartbeat-timeout`：心跳超时时间，默认 15 秒。
-- `--max-retries`：任务默认最大重试次数，默认 2 次。
+## 自动路由示例
 
-## 启动 Mac Agent
-
-Mac Agent 需要向 Controller 注册并发送心跳：
-
-```bash
-python3 mac_agent.py \
-  --host 127.0.0.1 \
-  --port 9001 \
-  --controller-url http://127.0.0.1:8081 \
-  --registry-token dev-token
-```
-
-如果 Controller 和 Mac Agent 不在同一台机器上，把 `--controller-url` 改成 Controller 的局域网地址。
-
-## 启动 iPhone Agent
-
-在 Xcode 中打开：
-
-```text
-MobileAgent/MobileAgent.xcodeproj
-```
-
-在 App 中填写：
-
-```text
-Controller 地址：http://你的Mac局域网IP:8081
-Registry Token：dev-token
-```
-
-然后点击“开始轮询”。iPhone App 会执行以下操作：
-
-1. 注册 `iphone_agent_01`；
-2. 每 5 秒发送一次心跳；
-3. 轮询新的移动端任务；
-4. 完成任务后携带 `lease_id` 回传结果。
-
-## 自动任务路由
-
-用户只提交任务描述，不需要指定 Agent：
-
-用户也不能在请求中指定 `harness_id`、`selected_unit` 或 `agent_id`。这些字段会被 Controller 拒绝。Harness 只能由 Router 根据任务需求、硬件能力、负载和健康状态自动选择。
+任务只填写描述，不填写执行单元：
 
 ```bash
 curl -X POST http://127.0.0.1:8081/tasks \
   -H 'Content-Type: application/json' \
   -d '{
-    "task_id": "auto-mac-001",
-    "description": "读取本地文件并生成一份报告",
-    "input_path": "data/sample_input.txt"
+    "task_id": "dsh-file-001",
+    "description": "读取输入文件并生成一份报告",
+    "input_path": "/workspace/input.txt"
   }'
 ```
 
-Router 会推断：
-
-```text
-local_file_access + document_generation
-→ mac_agent_01
-```
-
-移动端任务示例：
-
-```bash
-curl -X POST http://127.0.0.1:8081/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "task_id": "iphone-001",
-    "description": "用手机拍一张照片",
-    "max_retries": 2
-  }'
-```
-
-查询任务：
+Controller 返回 `job_id` 和 Router 的选择结果。查询任务：
 
 ```bash
 curl http://127.0.0.1:8081/tasks/<job_id>
 ```
 
-## 动态注册 Agent
-
-新 Harness 可以在运行期间注册，不需要修改 Router 代码。Harness 可以在 `metadata.internal_agents` 中声明初始内部 Agent，也可以由真实 DSH/Native Harness 在启动时自行发现。注册请求必须携带令牌：
+执行单元也可以运行期间动态注册：
 
 ```bash
 curl -X POST http://127.0.0.1:8081/registry/register \
   -H 'Content-Type: application/json' \
-  -H 'X-Registry-Token: dev-token' \
+  -H "X-Registry-Token: $REGISTRY_TOKEN" \
   -d '{
-    "unit_id": "linux_gpu_harness_01",
+    "unit_id": "new_dsh_harness_01",
     "unit_type": "harness",
     "platforms": ["linux"],
-    "capabilities": ["python", "image_inference", "parallel_compute"],
-    "tools": ["cuda", "python"],
+    "capabilities": ["python", "parallel_compute"],
+    "tools": ["dsh", "python"],
     "state": "idle",
     "load": 0.0,
     "metadata": {
-      "transport": "http",
-      "harness_type": "dsh_microvm",
-      "scope": "harness",
-      "hardware": {
-        "architecture": "x86_64",
-        "cpu_cores": 32,
-        "memory_gb": 64,
-        "gpu": true,
-        "gpu_model": "NVIDIA A100",
-        "gpu_memory_gb": 40
-      },
-      "sandbox": {
-        "type": "microvm",
-        "profile": "dsh-linux-gpu"
-      }
+      "harness_type": "deepseek",
+      "sandbox": {"type": "microvm", "profile": "dsh-linux"},
+      "hardware": {"architecture": "x86_64", "cpu_cores": 8, "memory_gb": 16, "gpu": false}
     },
-    "endpoint": "http://10.0.0.12:9001",
     "heartbeat_required": true
   }'
 ```
 
-心跳请求：
+## MicroVM Pool 语义
 
-```bash
-curl -X POST http://127.0.0.1:8081/registry/heartbeat \
-  -H 'Content-Type: application/json' \
-  -H 'X-Registry-Token: dev-token' \
-  -d '{
-    "unit_id": "linux_gpu_agent_01",
-    "state": "idle",
-    "load": 0.25
-  }'
-```
-
-查看注册表：
-
-```bash
-curl http://127.0.0.1:8081/registry/units \
-  -H 'X-Registry-Token: dev-token'
-```
-
-## MicroVM Warm Pool
-
-只有声明了 MicroVM Sandbox 的执行单元才会使用 MicroVM 池：
-
-```json
-"metadata": {
-  "sandbox": {
-    "type": "microvm",
-    "profile": "dsh-linux"
-  }
-}
-```
-
-池的策略是一次性沙箱：
+池采用任务级一次性沙箱：
 
 ```text
-预热 3 个 READY MicroVM
-    ↓
-任务选中该 Harness
-    ↓
-租用 1 个 MicroVM
-    ↓
-立即创建新的 MicroVM 补足 3 个 READY
-    ↓
-任务完成后销毁原 MicroVM
-    ↓
-保留新建的干净 MicroVM
+启动 Controller → 预热 3 个 READY MicroVM
+任务选中 Harness → 租用 1 个 MicroVM
+租用后立即创建新 MicroVM 补足 READY 余额
+任务成功或失败 → 销毁本次任务 MicroVM
 ```
 
-任务成功、失败或 Harness 掉线后，原 MicroVM 都不会复用，从而避免文件、进程、凭证和网络状态残留。
+任务沙箱不归还，避免文件、进程、凭证和网络状态泄漏。池还支持以下控制面语义：
 
-查看 MicroVM 池：
+- 根据节点状态、CPU、内存和运行时版本选择节点；
+- 隔离或排空节点，阻止新任务进入故障节点；
+- 将 pause 快照写入共享目录，并在兼容节点恢复；
+- 通过运行时版本检查保证旧快照不会被不兼容组件恢复。
+
+`microvm_nodes.json` 中的 Node A / Node B 目前是同一台 ECS 上的逻辑节点，只能验证调度和状态语义，不能作为多物理机性能结果。真实跨主机恢复还需要接入 KVM、Firecracker 或 CubeSandbox，以及 S3/MinIO 等共享存储。
+
+节点运维接口示例：
 
 ```bash
-curl http://127.0.0.1:8081/microvms \
-  -H 'X-Registry-Token: dev-token'
+curl -H "X-Registry-Token: $REGISTRY_TOKEN" \
+  http://127.0.0.1:8081/ops/nodes
+
+curl -X POST -H "X-Registry-Token: $REGISTRY_TOKEN" \
+  http://127.0.0.1:8081/ops/nodes/node-ecs-01/isolate
+
+curl -X POST -H "X-Registry-Token: $REGISTRY_TOKEN" \
+  http://127.0.0.1:8081/ops/nodes/node-ecs-01/restore
 ```
 
-当前本地 Mac 使用 `MockMicroVMBackend` 验证池逻辑，不会真正启动 MicroVM。真正运行 MicroVM 时，需要在 Linux/KVM 节点接入 Firecracker、CubeSandbox 或其他 MicroVM Backend。
+## 掉线与恢复
 
-## Agent 掉线和自动恢复
+Controller 保存每次分配的 `lease_id`、`attempt` 和失败历史：
 
 ```text
-Agent 停止发送心跳
-    ↓
-Controller 超时检测
-    ↓
-Agent 标记为 offline
-    ↓
-相关任务进入 retry_wait
-    ↓
-Router 排除故障 Agent
-    ↓
-重新选择其他 Agent
-    ↓
-创建新的 MicroVM 并执行
+Harness 停止心跳
+  → Controller 标记 offline
+  → 任务进入 retry_wait
+  → Router 排除故障 Harness
+  → 重新选择在线 Harness
+  → 创建新的租约和 MicroVM
 ```
 
-每次任务分配都有独立的 `lease_id`。旧 Agent 即使恢复并回传结果，也不能覆盖新尝试的结果。
-
-默认任务允许重试；不可重复执行的任务可以关闭：
-
-```json
-{
-  "description": "发送一封邮件",
-  "retryable": false
-}
-```
-
-## API 概览
-
-| 方法 | 路径 | 作用 |
-|---|---|---|
-| `POST` | `/tasks` | 提交任务 |
-| `GET` | `/tasks/<job_id>` | 查询任务 |
-| `GET` | `/tasks` | 查询任务列表 |
-| `POST` | `/registry/register` | 注册 Agent |
-| `POST` | `/registry/heartbeat` | 更新心跳 |
-| `GET` | `/registry/units` | 查询动态注册表 |
-| `GET` | `/microvms` | 查询 MicroVM 池 |
-| `GET` | `/mobile/tasks/next` | iPhone 拉取任务 |
-| `POST` | `/mobile/tasks/<job_id>/result` | iPhone 回传结果 |
+旧 Harness 恢复后提交旧租约结果时，Controller 会拒绝该结果，不能覆盖新 attempt。
 
 ## 测试
 
 ```bash
 python3 -m unittest -v \
   test_router.py \
-  test_phase1_mac_iphone.py \
   test_reliability.py \
   test_microvm_pool.py
 ```
 
-当前测试覆盖：
+测试覆盖任务需求解析、硬约束路由、动态注册、心跳与掉线、任务重试、旧租约拒绝、Controller 重启恢复、MicroVM 预热/销毁/补池以及逻辑跨节点快照恢复。
 
-- 任务语义解析和硬约束路由；
-- 动态 Agent 注册；
-- Agent 心跳和掉线恢复；
-- 任务重试和旧租约拒绝；
-- Controller 重启后的任务恢复；
-- MicroVM 预热、租用、销毁和补充；
-- Mac HTTP Agent 和 iPhone Poll Agent 的基本流程。
+## 研究路线
+
+当前工程顺序为：
+
+1. 用 Mock Backend 完成 Router、Controller、Registry 和 MicroVM Pool 的协调验证；
+2. 在 ECS 上运行统一 DSH Harness，并用插件制造能力差异；
+3. 接入真实 MicroVM Backend 和共享快照存储；
+4. 引入 World Model，预测任务需求、Harness 成功率、延迟和资源状态；
+5. 在多节点和故障注入场景下进行正式对比实验。

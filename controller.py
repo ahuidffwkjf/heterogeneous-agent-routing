@@ -1,4 +1,4 @@
-"""Phase 1 controller with dynamic registration and fault recovery.
+"""Controller for the DSH + MicroVM experiment.
 
 The Controller owns task state and the execution-unit registry. The Router
 only makes a routing decision from the latest registry snapshot. Agents can
@@ -30,7 +30,7 @@ from registry import UnitRegistry
 from router import ExecutionUnit, NoEligibleUnit, Router, Task, TaskParser
 
 
-DEFAULT_REGISTRY = Path(__file__).with_name("execution_units.json")
+DEFAULT_REGISTRY = Path(__file__).with_name("execution_units_dsh.json")
 DEFAULT_DATABASE = Path(__file__).with_name("registry.db")
 FORBIDDEN_ROUTING_FIELDS = {
     "harness_id",
@@ -91,7 +91,6 @@ class PhaseOneController:
     def __init__(
         self,
         registry_path: str | Path = DEFAULT_REGISTRY,
-        mac_agent_url: str | None = None,
         database_path: str | Path = DEFAULT_DATABASE,
         heartbeat_timeout: float = 15.0,
         monitor_interval: float = 2.0,
@@ -106,13 +105,9 @@ class PhaseOneController:
         self.registry = UnitRegistry(database_path)
         self.registry_token = registry_token or secrets.token_urlsafe(24)
         units = load_execution_units(registry_path)
-        if mac_agent_url and "mac_agent_01" in {unit.unit_id for unit in units}:
-            for unit in units:
-                if unit.unit_id == "mac_agent_01":
-                    unit.endpoint = mac_agent_url.rstrip("/")
 
-        # Seed the local config into SQLite. New remote units must register
-        # with a token and heartbeat by calling the API.
+        # Seed the configured DSH Harnesses into SQLite. New remote Harnesses
+        # must register with a token and heartbeat by calling the API.
         for unit in units:
             heartbeat_required = bool(unit.metadata.get("heartbeat_required", False))
             self.registry.register(unit, heartbeat_required=heartbeat_required)
@@ -823,12 +818,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global CONTROLLER
-    parser = argparse.ArgumentParser(description="Phase 1 Mac + iPhone controller")
+    parser = argparse.ArgumentParser(description="DSH Harness + MicroVM controller")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--registry", default=str(DEFAULT_REGISTRY))
     parser.add_argument("--database", default=str(DEFAULT_DATABASE))
-    parser.add_argument("--mac-agent-url", default=None)
     parser.add_argument("--heartbeat-timeout", type=float, default=15.0)
     parser.add_argument("--monitor-interval", type=float, default=2.0)
     parser.add_argument("--max-retries", type=int, default=2)
@@ -847,7 +841,6 @@ def main() -> None:
         microvm_nodes = node_config.get("nodes", node_config)
     CONTROLLER = PhaseOneController(
         args.registry,
-        args.mac_agent_url,
         args.database,
         args.heartbeat_timeout,
         args.monitor_interval,
@@ -860,7 +853,7 @@ def main() -> None:
         args.microvm_runtime_version,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Phase 1 controller listening on http://{args.host}:{args.port}")
+    print(f"DSH controller listening on http://{args.host}:{args.port}")
     print(f"Registry token: {CONTROLLER.registry_token}")
     try:
         server.serve_forever()
