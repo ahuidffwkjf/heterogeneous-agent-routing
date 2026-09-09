@@ -1,8 +1,48 @@
-# 异构 Agent Router：Mac + iPhone + MicroVM
+# 异构 Agent Router：DeepSeek Harness + MicroVM
 
-这是一个面向异构 Agent Harness 的第一阶段实验原型。
+这是一个面向异构 Agent Harness 的实验原型。当前主线是：在 ECS 上运行 Controller、Router、Registry 和 MicroVM Pool，在每个隔离执行环境内运行统一的 DeepSeek Harness，并通过插件、权限、数据位置和资源状态形成能力差异。
 
-系统由 Controller、TaskRouter、动态 Harness Registry、Harness Runtime 和 MicroVM Warm Pool 组成。全局 Router 根据任务语义、平台、能力、硬件和在线状态选择 Harness；Harness 自己发现内部 Agent，并按任务需求组建 Agent Team。用户和全局 Router 不需要知道 Team 内部如何分工。
+系统由 Controller、TaskRouter、动态 Harness Registry、DSH Adapter、Harness Runtime 和 MicroVM Warm Pool 组成。全局 Router 根据任务语义、能力、工具、硬件和在线状态选择 Harness；Harness 自己发现内部 Agent，并按任务需求组建 Agent Team。用户和全局 Router 不需要知道 Team 内部如何分工。
+
+## 项目结构图
+
+```mermaid
+flowchart LR
+    U["用户任务"] --> C["Controller\n任务生命周期与故障恢复"]
+
+    C --> R["Router / TaskParser\n能力解析与自动路由"]
+    C --> REG["Registry\nSQLite：能力、硬件、心跳、状态"]
+    C --> JOB["Job Store\n任务状态、租约、失败历史"]
+    C --> OPS["Operations API\n节点隔离、排空、恢复"]
+    C --> P["MicroVM Pool\n预热、租用、销毁、补池"]
+
+    R --> H1["DSH Harness VM 1\n文件 / 文档插件"]
+    R --> H2["DSH Harness VM 2\n代码 / Python / 编译插件"]
+    R --> H3["DSH Harness VM 3\n数据处理 / 结构化输出插件"]
+
+    P --> N1["Node A\n资源与运行时版本"]
+    P --> N2["Node B\n资源与运行时版本"]
+    N1 --> H1
+    N1 --> H2
+    N2 --> H3
+
+    H1 --> A1["DSH Adapter\n注册、心跳、轮询、结果回传"]
+    H2 --> A2["DSH Adapter"]
+    H3 --> A3["DSH Adapter"]
+    A1 -. "outbound polling" .-> C
+    A2 -. "outbound polling" .-> C
+    A3 -. "outbound polling" .-> C
+
+    P --> S["Shared Snapshot Store\npause / resume / 跨节点恢复"]
+    S --> N1
+    S --> N2
+
+    H1 -. "内部发现与组队，对外隐藏" .-> T1["Private Agent / Agent Team"]
+    H2 -. "内部发现与组队，对外隐藏" .-> T2["Private Agent / Agent Team"]
+    H3 -. "内部发现与组队，对外隐藏" .-> T3["Private Agent / Agent Team"]
+```
+
+当前研究边界是：全局 Router 只选择 DSH Harness 实例，不直接选择 Harness 内部 Agent；MicroVM Pool 负责隔离和生命周期，DSH 负责 Harness 内部工具、插件和 Agent 协作。
 
 ## 当前架构
 
@@ -13,9 +53,10 @@ Controller
    ├── SQLite Registry：Agent 注册、硬件和心跳
    ├── Job Store：任务状态和失败历史
    ├── TaskRouter：任务解析与执行单元选择
-    └── MicroVMPool：按 Harness Profile 管理预热 MicroVM
+   ├── DSH Adapter：统一 DeepSeek Harness 的注册、轮询和执行
+   └── MicroVMPool：按 Harness Profile 管理预热 MicroVM
            ↓
-    Mac Harness / iPhone Harness / DSH-MicroVM Harness
+    DSH Harness + Plugins
            ↓
     Harness 内部发现 Agent / Agent Team
 ```
@@ -58,6 +99,8 @@ Hardware Node
 | `registry.py` | SQLite 动态 Agent Registry 和 Job Store |
 | `microvm_pool.py` | MicroVM 预热池、租用、销毁和补充 |
 | `microvm_nodes.json` | 多节点、运行时版本和资源容量的实验配置 |
+| `dsh_agent.py` | 在 MicroVM 内运行的 DeepSeek Harness 轮询适配器 |
+| `execution_units_dsh.json` | DSH Harness 实验执行单元配置 |
 | `harness_runtime.py` | Harness 内部 Agent 发现和 Agent Team 组建 |
 | `mac_agent.py` | Mac HTTP Agent |
 | `execution_units.json` | 初始执行单元配置 |
@@ -123,6 +166,51 @@ curl -X POST -H "X-Registry-Token: $REGISTRY_TOKEN" \
 ```
 
 当前仍未实现真实内存页、磁盘块和 TAP 网络设备的迁移；这些属于后续 KVM/CubeSandbox Backend 的职责。
+
+## ECS 上的 DSH MicroVM 实验
+
+当前实验使用三个统一的 DeepSeek Harness 执行单元。它们不是三种不同 Harness，而是同一 DSH 运行时的不同插件/能力配置：
+
+```text
+dsh_harness_01 → 文件、文档、Python
+dsh_harness_02 → Shell、Python、代码构建
+dsh_harness_03 → 数据处理、结构化抽取、Python
+```
+
+使用 DSH 配置启动 Controller：
+
+```bash
+python3 -u phase1_mac_iphone.py \
+  --host 0.0.0.0 \
+  --port 8081 \
+  --registry execution_units_dsh.json \
+  --database registry.db \
+  --registry-token "$REGISTRY_TOKEN" \
+  --microvm-pool-size 3 \
+  --microvm-max-total 8 \
+  --microvm-nodes microvm_nodes.json \
+  --microvm-snapshot-dir /opt/heterogeneous-agents/microvm_snapshots
+```
+
+每个 DSH Harness 进程应在自己的 MicroVM 内运行：
+
+```bash
+python3 dsh_agent.py \
+  --controller-url http://CONTROLLER_IP:8081 \
+  --registry-token "$REGISTRY_TOKEN" \
+  --unit-id dsh_harness_01 \
+  --profile headless \
+  --capability local_file_access \
+  --capability document_generation \
+  --capability python \
+  --tool dsh \
+  --tool python \
+  --plugin file \
+  --plugin document \
+  --workspace /workspace
+```
+
+`dsh_agent.py` 只向 Controller 暴露 Harness 的聚合能力，不暴露 DSH 内部 Agent 和 Agent Team。当前默认 Backend 仍是 Mock；确认 ECS 存在 `/dev/kvm` 后，再接入真实 CubeSandbox/Firecracker Backend。
 
 ## 启动 Controller
 
