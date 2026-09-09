@@ -9,35 +9,24 @@
 ## 当前结构
 
 ```mermaid
-flowchart LR
-    U["用户任务"] --> C["Controller\n任务生命周期与故障恢复"]
-    C --> R["Router / TaskParser\n需求推断与自动路由"]
-    C --> REG["Registry\nSQLite：能力、硬件、心跳"]
+flowchart TB
+    U["用户提交任务"] --> C["Controller\n监听任务、维护状态、处理重试"]
+    C --> R["TaskParser + Router\n理解需求并自动选择 Harness"]
+    R --> P["MicroVM Pool\n租用一个干净的任务沙箱"]
+    P --> V["Selected MicroVM\n任务级一次性执行环境"]
+    V --> H["DSH Harness\n插件 + 内部 Agent / Team"]
+    H --> A["DSH Adapter\n执行任务并返回统一结果"]
+    A -. "轮询任务 / 回传结果" .-> C
+
+    C --> REG["Registry\n能力、硬件、心跳、在线状态"]
     C --> JOB["Job Store\n状态、租约、失败历史"]
-    C --> P["MicroVM Pool\n预热、租用、销毁、补池"]
-    R --> H1["DSH Harness 1\n文件 / 文档插件"]
-    R --> H2["DSH Harness 2\n代码 / Python 插件"]
-    R --> H3["DSH Harness 3\n数据处理插件"]
-    P --> N1["Node A"]
-    P --> N2["Node B"]
-    N1 --> H1
-    N1 --> H2
-    N2 --> H3
-    H1 --> A1["DSH Adapter\n注册、心跳、轮询、执行"]
-    H2 --> A2["DSH Adapter"]
-    H3 --> A3["DSH Adapter"]
-    A1 -. "主动轮询" .-> C
-    A2 -. "主动轮询" .-> C
-    A3 -. "主动轮询" .-> C
-    H1 -. "内部发现与组队，对外隐藏" .-> T1["Private Agent / Team"]
-    H2 -. "内部发现与组队，对外隐藏" .-> T2["Private Agent / Team"]
-    H3 -. "内部发现与组队，对外隐藏" .-> T3["Private Agent / Team"]
-    P --> S["Shared Snapshot Store\n快照与跨节点恢复"]
+    P --> S["Snapshot Store\npause / resume"]
+    C -. "掉线后重新路由" .-> R
 ```
 
 主目录只保留当前 DSH + MicroVM 主线。Mac/iPhone 是早期概念验证，已单独放入 [`archive/early_mac_iphone/`](archive/early_mac_iphone/)，实验过程见 [`reports/early_mac_iphone_experiment.md`](reports/early_mac_iphone_experiment.md)。
 
-新的分层架构图见 [`docs/architecture_v2.md`](docs/architecture_v2.md)，其中分别展示控制面、执行面、隔离层和故障恢复路径。
+新的简化架构图见 [`docs/architecture_v2.md`](docs/architecture_v2.md)，其中分别展示主执行链路、状态管理和故障恢复路径。
 
 ## 核心流程
 
