@@ -1,0 +1,26 @@
+{
+  "nodes": [
+    {
+      "node_id": "node-ecs-01",
+      "state": "ready",
+      "total_vcpus": 8,
+      "total_memory_mb": 16384,
+      "supported_runtime_versions": ["dsh-0.1"],
+      "labels": {
+        "zone": "ecs-a",
+        "backend": "mock"
+      }
+    },
+    {
+      "node_id": "node-ecs-02",
+      "state": "ready",
+      "total_vcpus": 8,
+      "total_memory_mb": 16384,
+      "supported_runtime_versions": ["dsh-0.1"],
+      "labels": {
+        "zone": "ecs-b",
+        "backend": "mock"
+      }
+    }
+  ]
+}

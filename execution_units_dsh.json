@@ -1,0 +1,85 @@
+{
+  "units": [
+    {
+      "unit_id": "dsh_harness_01",
+      "unit_type": "harness",
+      "platforms": ["linux"],
+      "capabilities": ["local_file_access", "document_generation", "python"],
+      "tools": ["dsh", "python", "shell"],
+      "state": "offline",
+      "load": 0.0,
+      "success_rate": 0.8,
+      "quality_score": 0.8,
+      "avg_latency_ms": 1000,
+      "cost_score": 0.2,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "harness_type": "deepseek_harness",
+        "runtime": "dsh",
+        "dsh_profile": "headless",
+        "plugins": ["file", "document", "python"],
+        "scope": "harness",
+        "sandbox": {
+          "type": "microvm",
+          "profile": "dsh-headless-file",
+          "runtime_version": "dsh-0.1"
+        }
+      }
+    },
+    {
+      "unit_id": "dsh_harness_02",
+      "unit_type": "harness",
+      "platforms": ["linux"],
+      "capabilities": ["code_build", "local_compute", "python"],
+      "tools": ["dsh", "python", "shell", "compiler"],
+      "state": "offline",
+      "load": 0.0,
+      "success_rate": 0.8,
+      "quality_score": 0.8,
+      "avg_latency_ms": 1000,
+      "cost_score": 0.2,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "harness_type": "deepseek_harness",
+        "runtime": "dsh",
+        "dsh_profile": "headless",
+        "plugins": ["shell", "python", "compiler"],
+        "scope": "harness",
+        "sandbox": {
+          "type": "microvm",
+          "profile": "dsh-headless-code",
+          "runtime_version": "dsh-0.1"
+        }
+      }
+    },
+    {
+      "unit_id": "dsh_harness_03",
+      "unit_type": "harness",
+      "platforms": ["linux"],
+      "capabilities": ["data_processing", "structured_extraction", "python"],
+      "tools": ["dsh", "python", "shell"],
+      "state": "offline",
+      "load": 0.0,
+      "success_rate": 0.8,
+      "quality_score": 0.8,
+      "avg_latency_ms": 1000,
+      "cost_score": 0.2,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "harness_type": "deepseek_harness",
+        "runtime": "dsh",
+        "dsh_profile": "headless",
+        "plugins": ["python", "data", "structured-output"],
+        "scope": "harness",
+        "sandbox": {
+          "type": "microvm",
+          "profile": "dsh-headless-data",
+          "runtime_version": "dsh-0.1"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+这是第一阶段 Mac Agent 的测试文件。
+Router 会根据任务语义自动选择 Mac Agent。
+Mac Agent 读取文件后返回行数、字符数和内容摘录。

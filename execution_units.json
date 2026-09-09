@@ -1,0 +1,92 @@
+{
+  "units": [
+    {
+      "unit_id": "mac_agent_01",
+      "unit_type": "single_agent",
+      "platforms": ["macos"],
+      "capabilities": [
+        "local_compute",
+        "local_file_access",
+        "document_generation",
+        "image_inference",
+        "code_build"
+      ],
+      "tools": ["python"],
+      "state": "idle",
+      "load": 0.0,
+      "success_rate": 0.95,
+      "quality_score": 0.88,
+      "avg_latency_ms": 500,
+      "cost_score": 0.25,
+      "endpoint": "http://127.0.0.1:9001",
+      "metadata": {
+        "transport": "http",
+        "heartbeat_required": true,
+        "harness_type": "mac_local",
+        "scope": "harness",
+        "internal_agents": [
+          {
+            "agent_id": "mac_file_agent",
+            "capabilities": ["local_file_access", "local_compute"],
+            "tools": ["python"],
+            "quality_score": 0.86
+          },
+          {
+            "agent_id": "mac_report_agent",
+            "capabilities": ["document_generation"],
+            "tools": ["python"],
+            "quality_score": 0.9
+          },
+          {
+            "agent_id": "mac_code_agent",
+            "capabilities": ["code_build", "local_compute"],
+            "tools": ["python", "xcode"],
+            "quality_score": 0.88
+          }
+        ],
+        "hardware": {
+          "platform": "macos",
+          "architecture": "arm64",
+          "gpu": false
+        }
+      }
+    },
+    {
+      "unit_id": "iphone_agent_01",
+      "unit_type": "single_agent",
+      "platforms": ["ios"],
+      "capabilities": ["mobile", "camera", "sensor", "image_inference"],
+      "tools": ["ios_app"],
+      "state": "idle",
+      "load": 0.0,
+      "success_rate": 0.88,
+      "quality_score": 0.82,
+      "avg_latency_ms": 1400,
+      "cost_score": 0.10,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "harness_type": "ios_mobile",
+        "scope": "harness",
+        "internal_agents": [
+          {
+            "agent_id": "iphone_camera_agent",
+            "capabilities": ["mobile", "camera"],
+            "tools": ["ios_app"],
+            "quality_score": 0.84
+          },
+          {
+            "agent_id": "iphone_sensor_agent",
+            "capabilities": ["mobile", "sensor"],
+            "tools": ["ios_app"],
+            "quality_score": 0.8
+          }
+        ],
+        "hardware": {
+          "platform": "ios",
+          "gpu": false
+        }
+      }
+    }
+  ]
+}

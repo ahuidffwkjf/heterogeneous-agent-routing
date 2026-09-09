@@ -1,0 +1,38 @@
+# Runtime state and local credentials
+registry.db
+*.db
+*.sqlite
+*.sqlite3
+registry_token
+registry-token
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# MicroVM runtime data
+microvm_snapshots/
+*.qcow2
+*.raw
+*.img
+*.sock
+
+# macOS / Xcode local state
+.DS_Store
+xcuserdata/
+DerivedData/
+build/
+
+# Local research material; keep code repository lightweight
+文章/*.pdf
+
+# Logs and local exports
+*.log
+*.out
+*.tmp
