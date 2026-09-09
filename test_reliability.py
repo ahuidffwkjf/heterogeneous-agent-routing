@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from controller import PhaseOneController
+from router import NoEligibleUnit
 
 
 class ReliabilityTests(unittest.TestCase):
@@ -32,6 +33,7 @@ class ReliabilityTests(unittest.TestCase):
                 "state": "idle",
                 "metadata": {"transport": "poll"},
                 "heartbeat_required": True,
+                "registration_mode": "trusted",
             }
         )
         self.assertEqual(self.controller.registry.get("iphone_agent_02").unit_id, "iphone_agent_02")
@@ -57,6 +59,54 @@ class ReliabilityTests(unittest.TestCase):
         self.assertNotEqual(job.selected_unit, original_unit)
         self.assertEqual(job.status, "queued")
         self.assertEqual(job.attempt, 2)
+
+    def test_new_unit_is_background_only_until_probe_succeeds(self):
+        unit = self.controller.register_unit(
+            {
+                "unit_id": "new_dsh_harness_01",
+                "unit_type": "harness",
+                "platforms": ["linux"],
+                "capabilities": ["new_capability"],
+                "tools": ["dsh"],
+                "state": "idle",
+                "metadata": {"transport": "poll"},
+                "heartbeat_required": True,
+            }
+        )
+        self.assertEqual(unit.state, "testing")
+        self.assertEqual(unit.metadata["routing_scope"], "background")
+        heartbeat_unit = self.controller.heartbeat(
+            {"unit_id": "new_dsh_harness_01", "state": "idle", "load": 0.0}
+        )
+        self.assertEqual(heartbeat_unit.state, "testing")
+        with self.assertRaises(NoEligibleUnit):
+            self.controller.submit(
+                {
+                    "task_id": "must-wait-for-probe",
+                    "description": "new capability task",
+                    "required_capabilities": ["new_capability"],
+                }
+            )
+
+        probe = self.controller.next_background_probe("new_dsh_harness_01")
+        self.assertIsNotNone(probe)
+        result = self.controller.complete_background_probe(
+            probe["probe_id"],
+            {"success": True, "latency_ms": 12.0, "executor": "new_dsh_harness_01"},
+            lease_id=probe["lease_id"],
+            reported_unit_id="new_dsh_harness_01",
+        )
+        self.assertEqual(result["unit"]["state"], "idle")
+        self.assertEqual(result["unit"]["metadata"]["routing_scope"], "foreground")
+
+        job = self.controller.submit(
+            {
+                "task_id": "can-run-after-probe",
+                "description": "new capability task",
+                "required_capabilities": ["new_capability"],
+            }
+        )
+        self.assertEqual(job.selected_unit, "new_dsh_harness_01")
 
     def test_job_is_persisted_and_recovered_after_controller_restart(self):
         job = self.controller.submit(

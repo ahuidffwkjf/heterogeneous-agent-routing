@@ -3,7 +3,9 @@
 The Controller owns task state and the execution-unit registry. The Router
 only makes a routing decision from the latest registry snapshot. Agents can
 join at runtime by POSTing /registry/register and stay available by sending
-heartbeats to /registry/heartbeat.
+heartbeats to /registry/heartbeat. Newly registered units enter a separate
+background canary lane until their probe evidence promotes them to the
+foreground routing pool.
 
 Dynamic registry endpoints require the X-Registry-Token header. Never expose
 an unauthenticated registration endpoint on a LAN.
@@ -87,6 +89,28 @@ class Job:
     microvm_runtime_version: str | None = None
 
 
+@dataclass
+class BackgroundProbe:
+    """A canary task used to onboard a newly registered Harness.
+
+    Probes are intentionally separate from foreground Jobs.  A probe can
+    update a unit's trust state, but it never becomes a user-visible task and
+    never enters the foreground Router queue.
+    """
+
+    probe_id: str
+    unit_id: str
+    task_id: str
+    description: str
+    lease_id: str
+    attempt: int = 1
+    status: str = "queued"  # queued | running | completed | failed
+    result: dict[str, Any] | None = None
+    created_at: float = 0.0
+    started_at: float | None = None
+    completed_at: float | None = None
+
+
 class PhaseOneController:
     def __init__(
         self,
@@ -101,6 +125,8 @@ class PhaseOneController:
         microvm_snapshot_dir: str | Path | None = None,
         microvm_nodes: list[MicroVMNode | dict[str, Any]] | None = None,
         microvm_runtime_version: str = "dsh-0.1",
+        probe_successes_required: int = 1,
+        probe_max_attempts: int = 3,
     ) -> None:
         self.registry = UnitRegistry(database_path)
         self.registry_token = registry_token or secrets.token_urlsafe(24)
@@ -123,6 +149,8 @@ class PhaseOneController:
             payload.setdefault("microvm_runtime_version", None)
             self.jobs[payload["job_id"]] = Job(**payload)
         self.poll_queues: dict[str, queue.Queue[str]] = {}
+        self.background_queues: dict[str, queue.Queue[str]] = {}
+        self.background_probes: dict[str, BackgroundProbe] = {}
         snapshot_dir = microvm_snapshot_dir
         if snapshot_dir is None:
             snapshot_dir = Path(database_path).expanduser().resolve().parent / "microvm_snapshots"
@@ -137,6 +165,11 @@ class PhaseOneController:
         self.heartbeat_timeout = heartbeat_timeout
         self.monitor_interval = monitor_interval
         self.default_max_retries = max(0, int(max_retries))
+        self.probe_successes_required = max(1, int(probe_successes_required))
+        self.probe_max_attempts = max(
+            self.probe_successes_required,
+            int(probe_max_attempts),
+        )
         self._stop_event = threading.Event()
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -145,6 +178,7 @@ class PhaseOneController:
         )
         self._refresh_router()
         self._ensure_microvm_pools()
+        self._ensure_background_probes()
         self._recover_jobs_after_restart()
         self._monitor_thread.start()
 
@@ -156,6 +190,7 @@ class PhaseOneController:
                 transport = unit.metadata.get("transport", "http" if unit.endpoint else "poll")
                 if transport == "poll":
                     self.poll_queues.setdefault(unit.unit_id, queue.Queue())
+                    self.background_queues.setdefault(unit.unit_id, queue.Queue())
 
     @staticmethod
     def _microvm_profile(unit: ExecutionUnit) -> str | None:
@@ -199,27 +234,215 @@ class PhaseOneController:
         unit_payload = payload.get("unit", payload)
         if not isinstance(unit_payload, dict) or not unit_payload.get("unit_id"):
             raise ValueError("registration requires a unit_id")
+        unit_id = str(unit_payload["unit_id"])
+        try:
+            existing = self.registry.get(unit_id)
+        except KeyError:
+            existing = None
         unit = ExecutionUnit.from_dict(unit_payload)
+        registration_mode = str(payload.get("registration_mode", "background"))
+        is_new = existing is None
+        should_onboard = registration_mode not in {"trusted", "eligible"}
+        if is_new and should_onboard:
+            unit.state = "testing"
+            unit.metadata = {
+                **unit.metadata,
+                "routing_scope": "background",
+                "onboarding_status": "testing",
+                "probe_count": 0,
+                "probe_successes": 0,
+                "probe_failures": 0,
+            }
+        elif existing and existing.state == "testing" and should_onboard:
+            # Re-registration must not accidentally promote a unit merely
+            # because its adapter reports an idle process state.
+            unit.state = "testing"
+            unit.metadata = {
+                **unit.metadata,
+                "routing_scope": "background",
+                "onboarding_status": "testing",
+                "probe_count": existing.metadata.get("probe_count", 0),
+                "probe_successes": existing.metadata.get("probe_successes", 0),
+                "probe_failures": existing.metadata.get("probe_failures", 0),
+            }
         heartbeat_required = bool(payload.get("heartbeat_required", True))
         self.registry.register(unit, heartbeat_required=heartbeat_required)
         self._refresh_router()
         profile = self._microvm_profile(unit)
         if profile:
             self.microvm_pool.ensure_pool(profile)
+        if unit.state == "testing":
+            self._ensure_background_probe(unit, payload=payload)
         return self.router.units[unit.unit_id]
 
     def heartbeat(self, payload: dict[str, Any]) -> ExecutionUnit:
         unit_id = str(payload.get("unit_id", ""))
         if not unit_id:
             raise ValueError("heartbeat requires unit_id")
+        current = self.registry.get(unit_id)
+        reported_state = payload.get("state")
+        if current.state == "testing":
+            reported_state = "testing"
+        elif (
+            current.state == "degraded"
+            and current.metadata.get("routing_scope") == "background"
+        ):
+            reported_state = "degraded"
         unit = self.registry.heartbeat(
             unit_id,
-            state=payload.get("state"),
+            state=reported_state,
             load=payload.get("load"),
             metadata=payload.get("metadata"),
         )
         self._refresh_router()
         return unit
+
+    def _ensure_background_probes(self) -> None:
+        for unit in self.registry.list_units():
+            if unit.state == "testing":
+                self._ensure_background_probe(unit)
+
+    def _ensure_background_probe(
+        self,
+        unit: ExecutionUnit,
+        *,
+        payload: dict[str, Any] | None = None,
+        attempt: int = 1,
+    ) -> BackgroundProbe | None:
+        with self.lock:
+            active = [
+                probe
+                for probe in self.background_probes.values()
+                if probe.unit_id == unit.unit_id
+                and probe.status in {"queued", "running"}
+            ]
+            if active:
+                return active[0]
+            if attempt > self.probe_max_attempts:
+                return None
+            metadata = dict(unit.metadata)
+            description = str(
+                (payload or {}).get("probe_task")
+                or metadata.get("probe_task")
+                or (
+                    "Run a short canary task using the declared Harness plugins, "
+                    "report success, latency, and any tool failure."
+                )
+            )
+            now = time.time()
+            probe = BackgroundProbe(
+                probe_id=uuid.uuid4().hex[:12],
+                unit_id=unit.unit_id,
+                task_id=f"probe-{unit.unit_id}-{uuid.uuid4().hex[:8]}",
+                description=description,
+                lease_id=uuid.uuid4().hex,
+                attempt=attempt,
+                created_at=now,
+            )
+            self.background_probes[probe.probe_id] = probe
+            self.background_queues.setdefault(unit.unit_id, queue.Queue()).put(
+                probe.probe_id
+            )
+            return probe
+
+    def next_background_probe(self, unit_id: str) -> dict[str, Any] | None:
+        self._refresh_router()
+        with self.lock:
+            unit = self.router.units.get(unit_id)
+            if unit is None:
+                raise ValueError("unknown execution unit")
+            if unit.state != "testing":
+                return None
+            try:
+                probe_id = self.background_queues.setdefault(
+                    unit_id, queue.Queue()
+                ).get_nowait()
+            except queue.Empty:
+                return None
+            probe = self.background_probes[probe_id]
+            if probe.status != "queued":
+                return None
+            probe.status = "running"
+            probe.started_at = time.time()
+            return {
+                "probe_id": probe.probe_id,
+                "lease_id": probe.lease_id,
+                "attempt": probe.attempt,
+                "task_id": probe.task_id,
+                "description": probe.description,
+                "background": True,
+                "unit_id": unit_id,
+            }
+
+    def complete_background_probe(
+        self,
+        probe_id: str,
+        outcome: dict[str, Any],
+        *,
+        lease_id: str | None = None,
+        reported_unit_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if probe_id not in self.background_probes:
+                raise KeyError(probe_id)
+            probe = self.background_probes[probe_id]
+            if lease_id and lease_id != probe.lease_id:
+                raise ValueError("stale_probe_lease")
+            if reported_unit_id and reported_unit_id != probe.unit_id:
+                raise ValueError("probe_unit_mismatch")
+            if probe.status in {"completed", "failed"}:
+                return asdict(probe)
+            probe.result = dict(outcome)
+            probe.completed_at = time.time()
+            success = bool(outcome.get("success"))
+            probe.status = "completed" if success else "failed"
+
+            unit = self.registry.get(probe.unit_id)
+            metadata = dict(unit.metadata)
+            count = int(metadata.get("probe_count", 0)) + 1
+            successes = int(metadata.get("probe_successes", 0)) + int(success)
+            failures = int(metadata.get("probe_failures", 0)) + int(not success)
+            history = list(metadata.get("probe_history", []))
+            history.append(
+                {
+                    "probe_id": probe.probe_id,
+                    "attempt": probe.attempt,
+                    "success": success,
+                    "latency_ms": outcome.get("latency_ms"),
+                    "failure_type": outcome.get("failure_type"),
+                    "timestamp": probe.completed_at,
+                }
+            )
+            metadata.update(
+                {
+                    "probe_count": count,
+                    "probe_successes": successes,
+                    "probe_failures": failures,
+                    "probe_history": history[-20:],
+                    "confidence": round(successes / max(1, count), 4),
+                }
+            )
+            if successes >= self.probe_successes_required:
+                unit.state = "idle"
+                metadata["routing_scope"] = "foreground"
+                metadata["onboarding_status"] = "eligible"
+            elif probe.attempt < self.probe_max_attempts:
+                unit.state = "testing"
+                metadata["routing_scope"] = "background"
+                metadata["onboarding_status"] = "testing"
+            else:
+                unit.state = "degraded"
+                metadata["routing_scope"] = "background"
+                metadata["onboarding_status"] = "probe_failed"
+            unit.metadata = metadata
+            self.registry.register(unit, heartbeat_required=True)
+            self._refresh_router()
+            if unit.state == "testing":
+                self._ensure_background_probe(unit, attempt=probe.attempt + 1)
+            return {
+                "probe": asdict(probe),
+                "unit": serialize_unit(unit),
+            }
 
     def submit(self, task_data: dict[str, Any]) -> Job:
         forced_fields = sorted(FORBIDDEN_ROUTING_FIELDS.intersection(task_data))
@@ -701,6 +924,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(task)
             return
+        if parsed.path == "/background/tasks/next":
+            unit_id = parse_qs(parsed.query).get("unit_id", [""])[0]
+            try:
+                probe = CONTROLLER.next_background_probe(unit_id)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, status=400)
+                return
+            if probe is None:
+                self.send_response(204)
+                self.end_headers()
+                return
+            self._json(probe)
+            return
         if parsed.path.startswith("/tasks/"):
             try:
                 job = CONTROLLER.get_job(parsed.path.rsplit("/", 1)[-1])
@@ -789,6 +1025,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "unit": serialize_unit(unit)})
                 return
             if (
+                parsed.path.startswith("/background/tasks/")
+                and parsed.path.endswith("/result")
+            ):
+                parts = parsed.path.strip("/").split("/")
+                payload = self._read_json()
+                result = CONTROLLER.complete_background_probe(
+                    parts[2],
+                    payload,
+                    lease_id=payload.get("lease_id"),
+                    reported_unit_id=payload.get("executor"),
+                )
+                self._json(result)
+                return
+            if (
                 parsed.path.startswith("/mobile/tasks/") or parsed.path.startswith("/tasks/")
             ) and parsed.path.endswith("/result"):
                 parts = parsed.path.strip("/").split("/")
@@ -832,6 +1082,8 @@ def main() -> None:
     parser.add_argument("--microvm-snapshot-dir", default=None)
     parser.add_argument("--microvm-runtime-version", default="dsh-0.1")
     parser.add_argument("--microvm-nodes", default=None)
+    parser.add_argument("--probe-successes-required", type=int, default=1)
+    parser.add_argument("--probe-max-attempts", type=int, default=3)
     args = parser.parse_args()
     if CONTROLLER is not None:
         CONTROLLER.close()
@@ -851,6 +1103,8 @@ def main() -> None:
         args.microvm_snapshot_dir,
         microvm_nodes,
         args.microvm_runtime_version,
+        args.probe_successes_required,
+        args.probe_max_attempts,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"DSH controller listening on http://{args.host}:{args.port}")

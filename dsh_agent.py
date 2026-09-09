@@ -8,7 +8,9 @@ the official DSH headless profile:
     dsh --profile headless "task text"
 
 The adapter does not expose DSH's internal agents or teams to the global
-Registry.  It reports only the aggregate Harness capability summary.
+Registry. It reports only the aggregate Harness capability summary. A newly
+registered unit automatically consumes background canary probes first and
+switches to the foreground task queue after promotion.
 """
 
 from __future__ import annotations
@@ -86,6 +88,7 @@ class DSHAgent:
         self.timeout = timeout
         self.state = "idle"
         self.load = 0.0
+        self.background_mode = False
         self._stop = threading.Event()
 
     def registration_payload(self) -> dict[str, Any]:
@@ -120,10 +123,14 @@ class DSHAgent:
                     "gpu": bool(os.environ.get("CUDA_VISIBLE_DEVICES")),
                 },
             },
+            # Unknown runtime Harnesses are onboarded through the background
+            # probe lane. Pre-seeded units keep their configured foreground
+            # status when they reconnect.
+            "registration_mode": "background",
         }
 
     def register(self) -> None:
-        status, _ = request_json(
+        status, body = request_json(
             "POST",
             f"{self.controller_url}/registry/register",
             token=self.registry_token,
@@ -131,10 +138,19 @@ class DSHAgent:
         )
         if status != 201:
             raise RuntimeError(f"registration_failed:{status}")
+        self._update_mode(body)
         print(f"Registered DSH Harness {self.unit_id} with profile {self.profile}")
 
+    def _update_mode(self, body: dict[str, Any] | None) -> None:
+        unit = (body or {}).get("unit", {})
+        metadata = unit.get("metadata", {}) if isinstance(unit, dict) else {}
+        self.background_mode = (
+            unit.get("state") == "testing"
+            or metadata.get("routing_scope") == "background"
+        )
+
     def heartbeat(self) -> None:
-        request_json(
+        _status, body = request_json(
             "POST",
             f"{self.controller_url}/registry/heartbeat",
             token=self.registry_token,
@@ -145,12 +161,14 @@ class DSHAgent:
             },
             timeout=5.0,
         )
+        self._update_mode(body)
 
-    def poll(self) -> dict[str, Any] | None:
+    def poll(self, *, background: bool = False) -> dict[str, Any] | None:
         query = urlencode({"unit_id": self.unit_id})
+        path = "/background/tasks/next" if background else "/tasks/next"
         status, task = request_json(
             "GET",
-            f"{self.controller_url}/tasks/next?{query}",
+            f"{self.controller_url}{path}?{query}",
             token=self.registry_token,
             timeout=10.0,
         )
@@ -217,6 +235,18 @@ class DSHAgent:
             timeout=15.0,
         )
 
+    def complete_probe(self, task: dict[str, Any], outcome: dict[str, Any]) -> None:
+        probe_id = str(task["probe_id"])
+        outcome["executor"] = self.unit_id
+        outcome["lease_id"] = task.get("lease_id")
+        request_json(
+            "POST",
+            f"{self.controller_url}/background/tasks/{probe_id}/result",
+            token=self.registry_token,
+            payload=outcome,
+            timeout=15.0,
+        )
+
     def run(self) -> None:
         self.register()
         while not self._stop.is_set():
@@ -224,7 +254,7 @@ class DSHAgent:
                 self.state = "idle"
                 self.load = 0.0
                 self.heartbeat()
-                task = self.poll()
+                task = self.poll(background=self.background_mode)
                 if task is None:
                     self._stop.wait(self.poll_interval)
                     continue
@@ -232,7 +262,10 @@ class DSHAgent:
                 self.load = 1.0
                 self.heartbeat()
                 outcome = self.execute(task)
-                self.complete(task, outcome)
+                if self.background_mode:
+                    self.complete_probe(task, outcome)
+                else:
+                    self.complete(task, outcome)
             except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
                 print(f"[DSH Agent] loop error: {exc}")
                 self._stop.wait(self.poll_interval)

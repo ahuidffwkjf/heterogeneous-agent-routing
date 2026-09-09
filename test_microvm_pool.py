@@ -49,6 +49,7 @@ class MicroVMPoolTests(unittest.TestCase):
                         "sandbox": {"type": "microvm", "profile": "dsh-linux"},
                     },
                     "heartbeat_required": True,
+                    "registration_mode": "trusted",
                 }
             )
             job = controller.submit(

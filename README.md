@@ -1,6 +1,6 @@
 # 异构 Agent Router：DeepSeek Harness + MicroVM
 
-> 当前版本：控制面原型 v0.2（DSH Harness、MicroVM Pool、动态注册与故障恢复）
+> 当前版本：控制面原型 v0.3（DSH Harness、MicroVM Pool、前后台测试隔离与故障恢复）
 
 这是一个面向异构 Agent Harness 的实验原型。当前主线聚焦于：用户提交自然语言任务，Controller 监听任务和状态，Router 自动选择合适的 DeepSeek Harness，MicroVM Pool 为 Harness 提供一次性隔离执行环境。
 
@@ -94,7 +94,9 @@ python3 -u controller.py \
   --microvm-pool-size 3 \
   --microvm-max-total 8 \
   --microvm-nodes microvm_nodes.json \
-  --microvm-snapshot-dir /opt/heterogeneous-agents/microvm_snapshots
+  --microvm-snapshot-dir /opt/heterogeneous-agents/microvm_snapshots \
+  --probe-successes-required 1 \
+  --probe-max-attempts 3
 ```
 
 检查服务：
@@ -135,6 +137,8 @@ dsh --profile headless "任务描述"
 
 如果要模拟三个 Harness，可以分别启动三个 Adapter，并使用各自的 `--unit-id`、能力和插件参数。当前 `microvm_pool.py` 默认是 `MockMicroVMBackend`，用于先验证控制面，不会创建真实 KVM 虚拟机。
 
+新加入且不在初始配置中的 Adapter 会自动进入后台测试模式。Adapter 会从 `/background/tasks/next` 拉取 Canary Task；测试成功后，Controller 才会把它切换为前台可调度状态。
+
 ## 自动路由示例
 
 任务只填写描述，不填写执行单元：
@@ -171,11 +175,51 @@ curl -X POST http://127.0.0.1:8081/registry/register \
     "load": 0.0,
     "metadata": {
       "harness_type": "deepseek",
+      "probe_task": "运行一个短时能力验证任务并返回成功、延迟和错误信息",
       "sandbox": {"type": "microvm", "profile": "dsh-linux"},
       "hardware": {"architecture": "x86_64", "cpu_cores": 8, "memory_gb": 16, "gpu": false}
     },
     "heartbeat_required": true
   }'
+```
+
+## 前台调度与后台测试隔离
+
+新 Harness 不会刚注册就抢占用户任务。Controller 将它放入独立的后台测试通道：
+
+```text
+新 Harness 注册
+    ↓
+testing / background-only
+    ↓
+后台 Canary Task
+    ↓
+记录成功率、延迟、错误和心跳
+    ↓
+达到阈值 → idle / foreground
+未达到阈值 → 继续测试或 degraded / background-only
+```
+
+两条队列完全分离：
+
+| 通道 | 任务来源 | 可调度对象 | 目的 |
+|---|---|---|---|
+| 前台队列 | 用户 `/tasks` | 已验证的 Harness | 尽快完成用户任务 |
+| 后台队列 | Controller Probe Scheduler | 新注册或待验证 Harness | 获取能力证据、更新可信度 |
+
+注册时不填写 `registration_mode`，默认进入后台测试。只有初始配置中的已知 Harness，或明确使用 `registration_mode: "trusted"` 的执行单元，才会直接进入前台。
+
+后台测试结果会写入 Registry 的 `probe_count`、`probe_successes`、`probe_failures`、`confidence` 和 `probe_history` 字段。默认一次成功的 Canary Task 即可晋升；正式实验可以通过 `--probe-successes-required` 提高门槛。
+
+Adapter 的后台流程是：
+
+```text
+注册 → 收到 testing 状态
+     → GET /background/tasks/next
+     → 执行 Canary Task
+     → POST /background/tasks/<probe_id>/result
+     → 收到 eligible/idle 状态
+     → 切换到 GET /tasks/next
 ```
 
 ## MicroVM Pool 语义

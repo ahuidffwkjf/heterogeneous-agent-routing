@@ -160,7 +160,7 @@ class ExecutionUnit:
     platforms: set[str] = field(default_factory=set)
     capabilities: set[str] = field(default_factory=set)
     tools: set[str] = field(default_factory=set)
-    state: str = "idle"  # idle | busy | degraded | offline
+    state: str = "idle"  # idle | busy | testing | degraded | offline
     load: float = 0.0  # 0.0 to 1.0
     success_rate: float = 0.8
     quality_score: float = 0.8
@@ -256,8 +256,10 @@ class Router:
     @staticmethod
     def _hard_constraint_failures(task: Task, unit: ExecutionUnit) -> list[str]:
         failures: list[str] = []
-        if unit.state == "offline":
-            failures.append("offline")
+        if unit.state in {"offline", "testing"}:
+            failures.append(unit.state)
+        if unit.metadata.get("routing_scope") == "background":
+            failures.append("background_only")
         if not task.required_capabilities.issubset(unit.capabilities):
             missing = sorted(task.required_capabilities - unit.capabilities)
             failures.append(f"missing_capabilities:{','.join(missing)}")
