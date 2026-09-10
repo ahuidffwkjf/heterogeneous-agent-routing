@@ -16,8 +16,10 @@ switches to the foreground task queue after promotion.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -48,7 +50,14 @@ def request_json(
     except HTTPError as exc:
         if exc.code == 204:
             return 204, None
-        raise
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        message = f"http_error:{exc.code}"
+        if detail:
+            message = f"{message}:{detail}"
+        raise RuntimeError(message) from exc
 
 
 def decode_json_response(response: HTTPResponse) -> dict[str, Any] | None:
@@ -72,6 +81,11 @@ class DSHAgent:
         plugins: list[str],
         workspace: str,
         dsh_bin: str = "dsh",
+        execution_mode: str = "host",
+        cube_api_url: str = "http://127.0.0.1:3000",
+        cube_api_key: str = "e2b_000000",
+        cube_proxy_node_ip: str | None = None,
+        cube_proxy_port_http: int = 80,
         poll_interval: float = 2.0,
         timeout: float = 900.0,
     ) -> None:
@@ -84,6 +98,11 @@ class DSHAgent:
         self.plugins = plugins
         self.workspace = workspace
         self.dsh_bin = dsh_bin
+        self.execution_mode = execution_mode
+        self.cube_api_url = cube_api_url.rstrip("/")
+        self.cube_api_key = cube_api_key
+        self.cube_proxy_node_ip = cube_proxy_node_ip
+        self.cube_proxy_port_http = int(cube_proxy_port_http)
         self.poll_interval = poll_interval
         self.timeout = timeout
         self.state = "idle"
@@ -185,6 +204,8 @@ class DSHAgent:
                 "failure_type": "empty_task_description",
                 "executor": self.unit_id,
             }
+        if self.execution_mode == "cube":
+            return self._execute_in_cube_sandbox(task, description)
         command = [self.dsh_bin, "--profile", "headless", description]
         try:
             completed = subprocess.run(
@@ -222,6 +243,90 @@ class DSHAgent:
             "output": output,
             "returncode": completed.returncode,
         }
+
+    def _execute_in_cube_sandbox(
+        self,
+        task: dict[str, Any],
+        description: str,
+    ) -> dict[str, Any]:
+        """Run DSH inside the task MicroVM selected by the Controller.
+
+        The Controller leases the sandbox and passes its ID with the poll
+        payload.  This adapter only connects to that lease; it never creates
+        or destroys the sandbox itself.  That keeps lifecycle ownership in
+        the Controller and makes retries safe.
+        """
+        started = time.perf_counter()
+        vm_id = str(task.get("microvm_id", ""))
+        if not vm_id:
+            return {
+                "success": False,
+                "failure_type": "missing_microvm_lease",
+                "executor": self.unit_id,
+            }
+        try:
+            from cubesandbox import Config, Sandbox
+
+            candidate_config_kwargs: dict[str, Any] = {
+                "api_url": self.cube_api_url,
+                "api_key": self.cube_api_key,
+                "proxy_port_http": self.cube_proxy_port_http,
+            }
+            if self.cube_proxy_node_ip:
+                candidate_config_kwargs["proxy_node_ip"] = self.cube_proxy_node_ip
+            parameters = inspect.signature(Config).parameters
+            accepts_arbitrary_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            config_kwargs = (
+                candidate_config_kwargs
+                if accepts_arbitrary_kwargs
+                else {
+                    key: value
+                    for key, value in candidate_config_kwargs.items()
+                    if key in parameters
+                }
+            )
+            sandbox = Sandbox.connect(vm_id, config=Config(**config_kwargs))
+            command = shlex.join(
+                [self.dsh_bin, "--profile", self.profile, description]
+            )
+            result = sandbox.commands.run(command)
+            returncode = int(getattr(result, "exit_code", 0) or 0)
+            stdout = str(getattr(result, "stdout", "") or "")
+            stderr = str(getattr(result, "stderr", "") or "")
+            return {
+                "success": returncode == 0,
+                "quality": 0.8 if returncode == 0 else 0.0,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+                "cost": 0.0,
+                "failure_type": None if returncode == 0 else "dsh_execution_failed",
+                "executor": self.unit_id,
+                "dsh_profile": self.profile,
+                "output": (stdout or stderr).strip(),
+                "returncode": returncode,
+                "execution_mode": "cube",
+                "microvm_id": vm_id,
+            }
+        except ImportError as exc:
+            return {
+                "success": False,
+                "failure_type": "cubesandbox_sdk_not_installed",
+                "error": str(exc),
+                "executor": self.unit_id,
+                "execution_mode": "cube",
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "failure_type": "cube_sandbox_execution_failed",
+                "error": str(exc),
+                "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+                "executor": self.unit_id,
+                "execution_mode": "cube",
+                "microvm_id": vm_id,
+            }
 
     def complete(self, task: dict[str, Any], outcome: dict[str, Any]) -> None:
         job_id = str(task["job_id"])
@@ -266,7 +371,14 @@ class DSHAgent:
                     self.complete_probe(task, outcome)
                 else:
                     self.complete(task, outcome)
-            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            except (
+                HTTPError,
+                URLError,
+                TimeoutError,
+                OSError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
                 print(f"[DSH Agent] loop error: {exc}")
                 self._stop.wait(self.poll_interval)
 
@@ -282,6 +394,29 @@ def main() -> None:
     parser.add_argument("--plugin", action="append", default=[])
     parser.add_argument("--workspace", default="/workspace")
     parser.add_argument("--dsh-bin", default="dsh")
+    parser.add_argument(
+        "--execution-mode",
+        choices=("host", "cube"),
+        default=os.environ.get("DSH_EXECUTION_MODE", "host"),
+        help="Run DSH on the adapter host or inside the leased CubeSandbox VM",
+    )
+    parser.add_argument(
+        "--cube-api-url",
+        default=os.environ.get("CUBE_API_URL", "http://127.0.0.1:3000"),
+    )
+    parser.add_argument(
+        "--cube-api-key",
+        default=os.environ.get("CUBE_API_KEY", "e2b_000000"),
+    )
+    parser.add_argument(
+        "--cube-proxy-node-ip",
+        default=os.environ.get("CUBE_PROXY_NODE_IP", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--cube-proxy-port-http",
+        type=int,
+        default=int(os.environ.get("CUBE_PROXY_PORT_HTTP", "80")),
+    )
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=900.0)
     args = parser.parse_args()
@@ -295,6 +430,11 @@ def main() -> None:
         plugins=args.plugin,
         workspace=args.workspace,
         dsh_bin=args.dsh_bin,
+        execution_mode=args.execution_mode,
+        cube_api_url=args.cube_api_url,
+        cube_api_key=args.cube_api_key,
+        cube_proxy_node_ip=args.cube_proxy_node_ip,
+        cube_proxy_port_http=args.cube_proxy_port_http,
         poll_interval=args.poll_interval,
         timeout=args.timeout,
     )

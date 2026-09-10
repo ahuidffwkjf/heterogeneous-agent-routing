@@ -18,6 +18,7 @@ the ECS has a real KVM-backed execution environment.
 from __future__ import annotations
 
 import json
+import inspect
 import threading
 import time
 import uuid
@@ -209,6 +210,135 @@ class MockMicroVMBackend:
 
     def destroy(self, vm: MicroVM) -> None:
         vm.state = "destroyed"
+
+
+class CubeSandboxBackend:
+    """Real MicroVM backend backed by the CubeSandbox Python SDK.
+
+    ``profile`` is mapped to a READY CubeSandbox template ID.  The backend
+    keeps the live SDK objects in memory because task VMs are intentionally
+    destroyed after completion.  The pool remains responsible for capacity,
+    placement metadata, and replenishment; CubeSandbox owns the actual VM
+    lifecycle.
+
+    The SDK is imported lazily so local tests do not need CubeSandbox or its
+    dependencies installed.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_url: str,
+        api_key: str = "e2b_000000",
+        proxy_node_ip: str | None = None,
+        proxy_port_http: int = 80,
+        template_map: dict[str, str] | None = None,
+        default_template_id: str | None = None,
+        sandbox_env_vars: dict[str, str] | None = None,
+    ) -> None:
+        self.api_url = api_url.rstrip("/")
+        self.api_key = api_key
+        self.proxy_node_ip = proxy_node_ip
+        self.proxy_port_http = int(proxy_port_http)
+        self.template_map = dict(template_map or {})
+        self.default_template_id = default_template_id
+        # These values are injected at Sandbox creation time and are never
+        # copied into task payloads or registry metadata.  In production this
+        # is where Controller supplies DSH credentials and the inner-harness
+        # execution policy to the outer CubeSandbox VM.
+        self.sandbox_env_vars = {
+            str(key): str(value)
+            for key, value in (sandbox_env_vars or {}).items()
+            if value is not None
+        }
+        self._sandboxes: dict[str, Any] = {}
+        self._lock = threading.RLock()
+
+    def _template_for(self, profile: str) -> str:
+        template_id = self.template_map.get(profile) or self.default_template_id
+        if not template_id:
+            raise RuntimeError(f"cube_template_missing:{profile}")
+        return str(template_id)
+
+    def _config(self, template_id: str) -> Any:
+        try:
+            from cubesandbox import Config
+        except ImportError as exc:
+            raise RuntimeError(
+                "cubesandbox_sdk_not_installed: pip install cubesandbox"
+            ) from exc
+        candidate_kwargs = {
+            "api_url": self.api_url,
+            "api_key": self.api_key,
+            "template_id": template_id,
+            "proxy_port_http": self.proxy_port_http,
+        }
+        if self.proxy_node_ip:
+            candidate_kwargs["proxy_node_ip"] = self.proxy_node_ip
+        parameters = inspect.signature(Config).parameters
+        accepts_arbitrary_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs = (
+            candidate_kwargs
+            if accepts_arbitrary_kwargs
+            else {
+                key: value
+                for key, value in candidate_kwargs.items()
+                if key in parameters
+            }
+        )
+        return Config(**kwargs)
+
+    def create(
+        self,
+        profile: str,
+        *,
+        node_id: str = DEFAULT_NODE_ID,
+        runtime_version: str = DEFAULT_RUNTIME_VERSION,
+        vcpus: int = 1,
+        memory_mb: int = 512,
+    ) -> MicroVM:
+        template_id = self._template_for(profile)
+        try:
+            from cubesandbox import Sandbox
+        except ImportError as exc:
+            raise RuntimeError(
+                "cubesandbox_sdk_not_installed: pip install cubesandbox"
+            ) from exc
+
+        create_kwargs: dict[str, Any] = {
+            "template": template_id,
+            "config": self._config(template_id),
+        }
+        if self.sandbox_env_vars:
+            create_kwargs["env_vars"] = dict(self.sandbox_env_vars)
+        sandbox = Sandbox.create(**create_kwargs)
+        vm_id = str(sandbox.sandbox_id)
+        with self._lock:
+            self._sandboxes[vm_id] = sandbox
+        return MicroVM(
+            vm_id=vm_id,
+            profile=profile,
+            node_id=node_id,
+            runtime_version=runtime_version,
+            state="ready",
+            created_at=time.time(),
+            vcpus=vcpus,
+            memory_mb=memory_mb,
+            network_id=f"cube-network-{vm_id}",
+        )
+
+    def destroy(self, vm: MicroVM) -> None:
+        with self._lock:
+            sandbox = self._sandboxes.pop(vm.vm_id, None)
+        if sandbox is None:
+            return
+        try:
+            sandbox.kill()
+        finally:
+            vm.state = "destroyed"
 
 
 class MicroVMPoolManager:
@@ -465,13 +595,21 @@ class MicroVMPoolManager:
         if selected_node is None:
             raise RuntimeError(f"no_capacity_for_runtime:{runtime}")
         selected_node.reserve(requested_vcpus, requested_memory)
-        vm = self.backend.create(
-            profile,
-            node_id=selected_node.node_id,
-            runtime_version=runtime,
-            vcpus=requested_vcpus,
-            memory_mb=requested_memory,
-        )
+        try:
+            vm = self.backend.create(
+                profile,
+                node_id=selected_node.node_id,
+                runtime_version=runtime,
+                vcpus=requested_vcpus,
+                memory_mb=requested_memory,
+            )
+        except Exception:
+            # Reserve happens before the external backend call.  If
+            # CubeSandbox (or another real backend) rejects creation, release
+            # the accounting reservation or later retries will see phantom
+            # resource usage and the node can become permanently unavailable.
+            selected_node.release(requested_vcpus, requested_memory)
+            raise
         vm.node_id = selected_node.node_id
         vm.runtime_version = runtime
         vm.vcpus = requested_vcpus

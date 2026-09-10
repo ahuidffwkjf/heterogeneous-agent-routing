@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import secrets
 import threading
@@ -27,7 +28,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from microvm_pool import MicroVMNode, MicroVMPoolManager, SharedSnapshotStore
+from microvm_pool import (
+    CubeSandboxBackend,
+    MicroVMNode,
+    MicroVMPoolManager,
+    SharedSnapshotStore,
+)
 from registry import UnitRegistry
 from router import ExecutionUnit, NoEligibleUnit, Router, Task, TaskParser
 
@@ -127,6 +133,7 @@ class PhaseOneController:
         microvm_runtime_version: str = "dsh-0.1",
         probe_successes_required: int = 1,
         probe_max_attempts: int = 3,
+        microvm_backend: Any | None = None,
     ) -> None:
         self.registry = UnitRegistry(database_path)
         self.registry_token = registry_token or secrets.token_urlsafe(24)
@@ -155,6 +162,7 @@ class PhaseOneController:
         if snapshot_dir is None:
             snapshot_dir = Path(database_path).expanduser().resolve().parent / "microvm_snapshots"
         self.microvm_pool = MicroVMPoolManager(
+            backend=microvm_backend,
             min_ready=max(0, int(microvm_pool_size)),
             max_total=max(max(1, int(microvm_max_total)), int(microvm_pool_size)),
             nodes=microvm_nodes,
@@ -203,6 +211,11 @@ class PhaseOneController:
 
     def _ensure_microvm_pools(self) -> None:
         for unit in self.router.units.values():
+            # The checked-in DSH registry starts units as offline until their
+            # adapters register and heartbeat.  Do not spend real
+            # CubeSandbox capacity warming a Harness that is not connected.
+            if unit.state == "offline":
+                continue
             profile = self._microvm_profile(unit)
             if profile:
                 self.microvm_pool.ensure_pool(profile)
@@ -679,9 +692,21 @@ class PhaseOneController:
                 job.lease_id = uuid.uuid4().hex
                 self._save_job_locked(job)
             else:
-                self._fail_locked(job, failure["failure_type"], outcome.get("error"))
+                self._fail_locked(
+                    job,
+                    failure["failure_type"],
+                    outcome.get("error"),
+                    outcome=outcome,
+                )
 
-    def _fail_locked(self, job: Job, failure_type: str, error: str | None) -> None:
+    def _fail_locked(
+        self,
+        job: Job,
+        failure_type: str,
+        error: str | None,
+        *,
+        outcome: dict[str, Any] | None = None,
+    ) -> None:
         if job.microvm_id:
             sandbox = {
                 "vm_id": job.microvm_id,
@@ -699,15 +724,19 @@ class PhaseOneController:
             sandbox = None
         job.status = "failed"
         job.completed_at = time.time()
-        job.result = {
+        result = dict(outcome or {})
+        result.update(
+            {
             "success": False,
-            "quality": 0.0,
-            "latency_ms": 0.0,
-            "cost": 0.0,
+            "quality": result.get("quality", 0.0),
+            "latency_ms": result.get("latency_ms", 0.0),
+            "cost": result.get("cost", 0.0),
             "failure_type": failure_type,
-            "error": error,
-            "executor": job.selected_unit,
-        }
+            "error": result.get("error") or error,
+            "executor": result.get("executor", job.selected_unit),
+            }
+        )
+        job.result = result
         if sandbox:
             job.result["sandbox"] = sandbox
         self._save_job_locked(job)
@@ -1043,8 +1072,11 @@ class Handler(BaseHTTPRequestHandler):
             ) and parsed.path.endswith("/result"):
                 parts = parsed.path.strip("/").split("/")
                 payload = self._read_json()
+                # /tasks/<job_id>/result has the job ID at index 1;
+                # /mobile/tasks/<job_id>/result has it at index 2.
+                job_id = parts[1] if parts[0] == "tasks" else parts[2]
                 job = CONTROLLER.complete(
-                    parts[2],
+                    job_id,
                     payload,
                     lease_id=payload.get("lease_id"),
                     reported_unit_id=payload.get("executor"),
@@ -1082,6 +1114,50 @@ def main() -> None:
     parser.add_argument("--microvm-snapshot-dir", default=None)
     parser.add_argument("--microvm-runtime-version", default="dsh-0.1")
     parser.add_argument("--microvm-nodes", default=None)
+    parser.add_argument(
+        "--microvm-backend",
+        choices=("mock", "cubesandbox"),
+        default=os.environ.get("MICROVM_BACKEND", "mock"),
+        help="MicroVM implementation: mock for tests or cubesandbox for ECS",
+    )
+    parser.add_argument(
+        "--cube-api-url",
+        default=os.environ.get("CUBE_API_URL", "http://127.0.0.1:3000"),
+    )
+    parser.add_argument(
+        "--cube-api-key",
+        default=os.environ.get("CUBE_API_KEY", "e2b_000000"),
+    )
+    parser.add_argument(
+        "--cube-proxy-node-ip",
+        default=os.environ.get("CUBE_PROXY_NODE_IP", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--cube-proxy-port-http",
+        type=int,
+        default=int(os.environ.get("CUBE_PROXY_PORT_HTTP", "80")),
+    )
+    parser.add_argument(
+        "--cube-template-id",
+        default=os.environ.get("CUBE_TEMPLATE_ID"),
+        help="Default READY CubeSandbox template used by all profiles",
+    )
+    parser.add_argument(
+        "--cube-template-map",
+        default=None,
+        help="JSON file mapping MicroVM profiles to READY template IDs",
+    )
+    parser.add_argument(
+        "--dsh-api-key-file",
+        default=os.environ.get("DEEPSEEK_API_KEY_FILE"),
+        help="Protected file containing DEEPSEEK_API_KEY; injected only at Sandbox creation",
+    )
+    parser.add_argument(
+        "--dsh-permission-mode",
+        default=os.environ.get("DSH_PERMISSION_MODE", "danger-full-access"),
+        choices=("read-only", "workspace-write", "danger-full-access"),
+        help="Inner DSH file policy; outer CubeSandbox remains the isolation boundary",
+    )
     parser.add_argument("--probe-successes-required", type=int, default=1)
     parser.add_argument("--probe-max-attempts", type=int, default=3)
     args = parser.parse_args()
@@ -1091,6 +1167,44 @@ def main() -> None:
     if args.microvm_nodes:
         node_config = json.loads(Path(args.microvm_nodes).read_text(encoding="utf-8"))
         microvm_nodes = node_config.get("nodes", node_config)
+    microvm_backend = None
+    if args.microvm_backend == "cubesandbox":
+        template_map: dict[str, str] = {}
+        if args.cube_template_map:
+            template_config = json.loads(
+                Path(args.cube_template_map).read_text(encoding="utf-8")
+            )
+            template_map = template_config.get("profiles", template_config)
+        sandbox_env_vars = {
+            "DSH_PERMISSION_MODE": args.dsh_permission_mode,
+        }
+        if args.dsh_api_key_file:
+            secret_path = Path(args.dsh_api_key_file).expanduser()
+            if not secret_path.is_file():
+                raise SystemExit(f"DEEPSEEK_API_KEY file not found: {secret_path}")
+            try:
+                secret_mode = secret_path.stat().st_mode & 0o777
+            except OSError as exc:
+                raise SystemExit(f"cannot stat DEEPSEEK_API_KEY file: {exc}") from exc
+            if secret_mode & 0o077:
+                raise SystemExit(
+                    f"DEEPSEEK_API_KEY file must not be group/world readable: {secret_path}"
+                )
+            api_key = secret_path.read_text(encoding="utf-8").strip()
+            if not api_key:
+                raise SystemExit(f"DEEPSEEK_API_KEY file is empty: {secret_path}")
+            sandbox_env_vars["DEEPSEEK_API_KEY"] = api_key
+        elif os.environ.get("DEEPSEEK_API_KEY"):
+            sandbox_env_vars["DEEPSEEK_API_KEY"] = os.environ["DEEPSEEK_API_KEY"]
+        microvm_backend = CubeSandboxBackend(
+            api_url=args.cube_api_url,
+            api_key=args.cube_api_key,
+            proxy_node_ip=args.cube_proxy_node_ip,
+            proxy_port_http=args.cube_proxy_port_http,
+            template_map=template_map,
+            default_template_id=args.cube_template_id,
+            sandbox_env_vars=sandbox_env_vars,
+        )
     CONTROLLER = PhaseOneController(
         args.registry,
         args.database,
@@ -1105,6 +1219,7 @@ def main() -> None:
         args.microvm_runtime_version,
         args.probe_successes_required,
         args.probe_max_attempts,
+        microvm_backend,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"DSH controller listening on http://{args.host}:{args.port}")

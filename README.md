@@ -2,31 +2,33 @@
 
 > 当前版本：控制面原型 v0.3（DSH Harness、MicroVM Pool、前后台测试隔离与故障恢复）
 
-这是一个面向异构 Agent Harness 的实验原型。当前主线聚焦于：用户提交自然语言任务，Controller 监听任务和状态，Router 自动选择合适的 DeepSeek Harness，MicroVM Pool 为 Harness 提供一次性隔离执行环境。
+这是一个面向异构 Agent Harness 的实验原型。用户只提交自然语言任务，系统自动完成 Harness 选择、MicroVM 分配、执行和故障恢复。
 
-不同 Harness 使用同一个 DSH 运行时，但可以安装不同插件、声明不同工具和能力。Harness 内部如何发现 Agent、是否组建 Agent Team 以及如何协作，对全局 Router 和用户都是隐藏的。
+当前实验统一使用 DeepSeek Harness（DSH），通过不同插件、工具和硬件配置制造 Harness 能力差异。Harness 内部如何发现 Agent、是否组建 Agent Team 以及如何协作，对全局 Router 和用户都是隐藏的。
 
 ## 当前结构
 
 ```mermaid
-flowchart TB
-    U["用户提交任务"] --> C["Controller\n监听任务、维护状态、处理重试"]
-    C --> R["TaskParser + Router\n理解需求并自动选择 Harness"]
-    R --> P["MicroVM Pool\n租用一个干净的任务沙箱"]
-    P --> V["Selected MicroVM\n任务级一次性执行环境"]
-    V --> H["DSH Harness\n插件 + 内部 Agent / Team"]
-    H --> A["DSH Adapter\n执行任务并返回统一结果"]
-    A -. "轮询任务 / 回传结果" .-> C
+flowchart LR
+    U["用户<br/>自然语言任务"] --> C["Controller<br/>接收任务 · 租约 · 重试"]
+    C --> R["TaskParser + Router<br/>自动选择 Harness"]
+    R --> P["MicroVM Pool<br/>预热 · 租用 · 补池"]
+    P --> V["一次性 CubeSandbox<br/>MicroVM"]
+    V --> H["DSH Harness<br/>插件 + Agent / Team"]
+    H --> O["统一结果"]
+    O --> C
 
-    C --> REG["Registry\n能力、硬件、心跳、在线状态"]
-    C --> JOB["Job Store\n状态、租约、失败历史"]
-    P --> S["Snapshot Store\npause / resume"]
-    C -. "掉线后重新路由" .-> R
+    REG["Registry<br/>能力 · 硬件 · 心跳"] -. "提供状态" .-> R
+    C -. "轮询任务 + vm_id" .-> A["DSH Adapter"]
+    A -. "连接并执行" .-> V
+    S["/root/deepseek_api_key<br/>运行时注入"] -. "只进入新 MicroVM" .-> P
 ```
+
+一句话理解：Router 只负责选 Harness，Controller 负责协调，MicroVM Pool 负责隔离环境，Harness 负责内部协作。
 
 主目录只保留当前 DSH + MicroVM 主线。Mac/iPhone 是早期概念验证，已单独放入 [`archive/early_mac_iphone/`](archive/early_mac_iphone/)，实验过程见 [`reports/early_mac_iphone_experiment.md`](reports/early_mac_iphone_experiment.md)。
 
-新的简化架构图见 [`docs/architecture_v2.md`](docs/architecture_v2.md)，其中分别展示主执行链路、状态管理和故障恢复路径。
+完整的生命周期说明见 [`docs/architecture_v2.md`](docs/architecture_v2.md)。
 
 ## 核心流程
 
@@ -50,13 +52,14 @@ POST /tasks
 | `controller.py` | Controller、任务 API、注册 API、心跳监视和故障恢复 |
 | `router.py` | TaskParser、硬约束过滤和执行单元评分 |
 | `registry.py` | SQLite Registry 和 Job Store |
-| `microvm_pool.py` | MicroVM 预热、租用、销毁、补池和快照语义 |
+| `microvm_pool.py` | MicroVM 预热、租用、销毁、补池、快照语义，以及 Mock/CubeSandbox Backend |
 | `microvm_nodes.json` | 逻辑节点、资源容量和运行时版本配置 |
 | `dsh_agent.py` | DSH Harness 的注册、心跳、轮询和执行适配器 |
 | `execution_units_dsh.json` | DSH Harness 能力、插件和 MicroVM Profile |
 | `test_router.py` | 路由和需求解析测试 |
 | `test_reliability.py` | 心跳、掉线、租约和重试测试 |
-| `test_microvm_pool.py` | MicroVM 池、节点和快照测试 |
+| `test_microvm_pool.py` | Mock MicroVM 池、节点和快照测试 |
+| `test_cube_sandbox_backend.py` | CubeSandbox Backend 的 SDK 调用、销毁和补池测试 |
 | `test_execution_units.json` | 测试专用的最小执行单元配置 |
 | `archive/early_mac_iphone/` | 早期 Mac/iPhone 原型归档 |
 | `reports/early_mac_iphone_experiment.md` | 早期实验报告 |
@@ -135,7 +138,90 @@ Adapter 使用 DSH 官方 headless 调用形式：
 dsh --profile headless "任务描述"
 ```
 
-如果要模拟三个 Harness，可以分别启动三个 Adapter，并使用各自的 `--unit-id`、能力和插件参数。当前 `microvm_pool.py` 默认是 `MockMicroVMBackend`，用于先验证控制面，不会创建真实 KVM 虚拟机。
+如果要模拟三个 Harness，可以分别启动三个 Adapter，并使用各自的 `--unit-id`、能力和插件参数。默认 `microvm_pool.py` 使用 `MockMicroVMBackend`，本地测试不会创建真实虚拟机。
+
+在 ECS 上切换到真实 CubeSandbox Backend 时，Adapter 可以使用任务中 Controller 传来的 `microvm_id` 连接到对应的 CubeSandbox。`--execution-mode cube` 会在该任务 MicroVM 内运行 DSH；前提是对应的 READY 模板中已经安装 `dsh` 及其插件。
+
+### ECS 上启用真实 CubeSandbox Backend
+
+先确认 ECS 上 CubeSandbox、PVM 和模板已经 READY，然后设置模板 ID：
+
+```bash
+export CUBE_API_URL="http://127.0.0.1:3000"
+export CUBE_API_KEY="e2b_000000"
+export CUBE_PROXY_NODE_IP="127.0.0.1"
+export CUBE_PROXY_PORT_HTTP=80
+export CUBE_TEMPLATE_ID="tpl-你的READY模板ID"
+
+# 不把 DeepSeek Key 写入任务、Registry 或模板；仅保存到 Controller 主机
+read -s DEEPSEEK_API_KEY
+printf '\n'
+printf '%s' "$DEEPSEEK_API_KEY" > /root/deepseek_api_key
+chmod 600 /root/deepseek_api_key
+unset DEEPSEEK_API_KEY
+```
+
+启动 Controller 时显式指定真实 Backend：
+
+```bash
+python3 -u controller.py \
+  --host 0.0.0.0 \
+  --port 8081 \
+  --registry execution_units_dsh.json \
+  --database registry.db \
+  --registry-token "$REGISTRY_TOKEN" \
+  --microvm-backend cubesandbox \
+  --cube-api-url "$CUBE_API_URL" \
+  --cube-api-key "$CUBE_API_KEY" \
+  --cube-proxy-node-ip "$CUBE_PROXY_NODE_IP" \
+  --cube-proxy-port-http "$CUBE_PROXY_PORT_HTTP" \
+  --cube-template-id "$CUBE_TEMPLATE_ID" \
+  --dsh-api-key-file /root/deepseek_api_key \
+  --dsh-permission-mode danger-full-access \
+  --microvm-pool-size 1 \
+  --microvm-max-total 2
+```
+
+`--dsh-api-key-file` 只在 Controller 创建 CubeSandbox 时读取，并通过
+`env_vars` 注入新 MicroVM；任务请求、Harness 注册信息和日志不会携带 API Key。
+`danger-full-access` 只关闭 DSH 在 MicroVM 内部的第二层本地沙箱，外层
+CubeSandbox MicroVM 仍然是实际的隔离边界。
+
+当前注册表有 3 个 Harness Profile，因此 `--microvm-pool-size 1` 会为每个已启用的 Profile 预热 1 个 Sandbox。第一次联调建议先使用 1 个 Profile，避免一次性创建过多真实 Sandbox。
+
+检查真实 VM ID：
+
+```bash
+curl -H "X-Registry-Token: $REGISTRY_TOKEN" \
+  http://127.0.0.1:8081/microvms
+```
+
+返回的 `vm_id` 应是 CubeSandbox 的 Sandbox ID，而不是 `mock-vm-*`。
+
+启动使用真实 CubeSandbox 执行面的 Adapter：
+
+```bash
+python3 dsh_agent.py \
+  --controller-url http://127.0.0.1:8081 \
+  --registry-token "$REGISTRY_TOKEN" \
+  --unit-id dsh_harness_01 \
+  --profile headless \
+  --execution-mode cube \
+  --cube-api-url "$CUBE_API_URL" \
+  --cube-api-key "$CUBE_API_KEY" \
+  --cube-proxy-node-ip "$CUBE_PROXY_NODE_IP" \
+  --cube-proxy-port-http "$CUBE_PROXY_PORT_HTTP" \
+  --capability local_file_access \
+  --capability document_generation \
+  --capability python \
+  --tool dsh \
+  --tool python \
+  --plugin file \
+  --plugin document \
+  --workspace /workspace
+```
+
+如果返回 `dsh_not_installed` 或 `dsh_execution_failed`，说明 CubeSandbox 本身正常，但当前模板还没有安装 DSH 或对应插件，需要重新制作一个包含 DSH Harness 的 READY 模板。
 
 新加入且不在初始配置中的 Adapter 会自动进入后台测试模式。Adapter 会从 `/background/tasks/next` 拉取 Canary Task；测试成功后，Controller 才会把它切换为前台可调度状态。
 
@@ -287,10 +373,10 @@ python3 -m unittest -v \
 
 1. 用 Mock Backend 完成 Router、Controller、Registry 和 MicroVM Pool 的协调验证；
 2. 在 ECS 上运行统一 DSH Harness，并用插件制造能力差异；
-3. 接入真实 MicroVM Backend 和共享快照存储；
+3. 在 ECS 上切换到 CubeSandbox Backend，并验证真实 Sandbox 的创建、销毁和补池；
 4. 引入 World Model，预测任务需求、Harness 成功率、延迟和资源状态；
 5. 在多节点和故障注入场景下进行正式对比实验。
 
 ## 当前版本边界
 
-当前版本已经可以在本地或 ECS 上验证 Router、Controller、Registry 和 MicroVM Pool 的协调关系，但 MicroVM 仍由 Mock Backend 表示，DSH Adapter 也需要单独启动。真实 KVM/CubeSandbox 接入、共享对象存储和 World Model 预测属于后续实验阶段。
+当前版本默认仍使用 Mock Backend 以保持本地测试快速稳定；ECS 启动时可以用 `--microvm-backend cubesandbox` 接入真实 CubeSandbox。共享对象存储、跨物理节点恢复和 World Model 预测仍属于后续实验阶段。
