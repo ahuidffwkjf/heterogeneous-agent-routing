@@ -108,6 +108,62 @@ class ReliabilityTests(unittest.TestCase):
         )
         self.assertEqual(job.selected_unit, "new_dsh_harness_01")
 
+    def test_harness_discovered_agent_is_background_tested_before_routing(self):
+        discovery = self.controller.discover_agents(
+            {
+                "harness_id": "dsh_test_mobile_01",
+                "agents": [
+                    {
+                        "agent_id": "vision-agent-01",
+                        "platforms": ["ios"],
+                        "capabilities": ["image_inference"],
+                        "tools": ["dsh", "ios_app"],
+                        "hardware": {"camera": True},
+                        "probe_task": "验证新发现视觉 Agent 能完成一项图像推理任务",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(discovery["accepted"][0]["state"], "testing")
+        self.assertIsNotNone(discovery["accepted"][0]["probe_id"])
+
+        with self.assertRaises(NoEligibleUnit):
+            self.controller.submit(
+                {
+                    "task_id": "must-wait-for-discovered-agent",
+                    "description": "图像推理",
+                    "required_capabilities": ["image_inference"],
+                }
+            )
+
+        probe = self.controller.next_background_probe("dsh_test_mobile_01")
+        self.assertEqual(probe["kind"], "agent_discovery")
+        self.assertEqual(probe["candidate_id"], "vision-agent-01")
+        result = self.controller.complete_background_probe(
+            probe["probe_id"],
+            {
+                "success": True,
+                "latency_ms": 18.0,
+                "executor": "dsh_test_mobile_01",
+            },
+            lease_id=probe["lease_id"],
+            reported_unit_id="dsh_test_mobile_01",
+        )
+        self.assertEqual(result["candidate"]["state"], "eligible")
+        self.assertIn(
+            "image_inference",
+            self.controller.registry.get("dsh_test_mobile_01").capabilities,
+        )
+
+        job = self.controller.submit(
+            {
+                "task_id": "can-run-after-discovery",
+                "description": "图像推理",
+                "required_capabilities": ["image_inference"],
+            }
+        )
+        self.assertEqual(job.selected_unit, "dsh_test_mobile_01")
+
     def test_job_is_persisted_and_recovered_after_controller_restart(self):
         job = self.controller.submit(
             {

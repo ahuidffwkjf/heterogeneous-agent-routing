@@ -67,6 +67,20 @@ def serialize_unit(unit: ExecutionUnit) -> dict[str, Any]:
     # members remain private to the Harness runtime.
     metadata = dict(result.get("metadata", {}))
     metadata.pop("internal_agents", None)
+    # Agent discovery stays inside the parent Harness. The global Router sees
+    # only aggregate capabilities after a discovery probe succeeds.
+    candidates = metadata.pop("discovery_candidates", None)
+    if isinstance(candidates, dict):
+        metadata["discovered_agent_count"] = len(candidates)
+        states = {str(candidate.get("state", "unknown")) for candidate in candidates.values()}
+        metadata["discovered_agent_states"] = {
+            state: sum(
+                1
+                for candidate in candidates.values()
+                if candidate.get("state") == state
+            )
+            for state in states
+        }
     result["metadata"] = metadata
     result["harness_id"] = unit.unit_id
     result["scope"] = "harness"
@@ -115,6 +129,8 @@ class BackgroundProbe:
     created_at: float = 0.0
     started_at: float | None = None
     completed_at: float | None = None
+    kind: str = "onboarding"  # onboarding | agent_discovery
+    candidate_id: str | None = None
 
 
 class PhaseOneController:
@@ -253,6 +269,17 @@ class PhaseOneController:
         except KeyError:
             existing = None
         unit = ExecutionUnit.from_dict(unit_payload)
+        if existing:
+            # A Harness may reconnect with only its static registration
+            # fields. Preserve discovery state owned by Controller so a
+            # reconnect cannot erase candidates waiting for background tests.
+            for key in (
+                "discovery_candidates",
+                "discovered_capabilities",
+                "discovered_tools",
+            ):
+                if key in existing.metadata and key not in unit.metadata:
+                    unit.metadata[key] = existing.metadata[key]
         registration_mode = str(payload.get("registration_mode", "background"))
         is_new = existing is None
         should_onboard = registration_mode not in {"trusted", "eligible"}
@@ -288,6 +315,96 @@ class PhaseOneController:
             self._ensure_background_probe(unit, payload=payload)
         return self.router.units[unit.unit_id]
 
+    def discover_agents(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Accept Agent discoveries from a Harness without exposing internals.
+
+        Discovered Agents are candidates of the parent Harness, not global
+        Router units.  Each candidate is tested through the parent Harness's
+        background poll lane.  Only after a successful probe are its
+        capabilities folded into the parent's foreground routing summary.
+        """
+        harness_id = str(payload.get("harness_id") or payload.get("unit_id") or "")
+        if not harness_id:
+            raise ValueError("discovery requires harness_id")
+        parent = self.registry.get(harness_id)
+        if parent.state in {"offline", "degraded"}:
+            raise ValueError(f"harness_not_available:{harness_id}")
+        raw_agents = payload.get("agents", payload.get("discovered_agents", []))
+        if not isinstance(raw_agents, list) or not raw_agents:
+            raise ValueError("discovery requires a non-empty agents list")
+
+        with self.lock:
+            metadata = dict(parent.metadata)
+            candidates = dict(metadata.get("discovery_candidates", {}))
+            accepted: list[dict[str, Any]] = []
+            for raw in raw_agents:
+                if not isinstance(raw, dict):
+                    raise ValueError("each discovered agent must be an object")
+                candidate_id = str(raw.get("agent_id") or raw.get("id") or "")
+                if not candidate_id:
+                    raise ValueError("discovered agent requires agent_id")
+                capabilities = sorted({str(value) for value in raw.get("capabilities", [])})
+                tools = sorted({str(value) for value in raw.get("tools", [])})
+                platforms = sorted({str(value) for value in raw.get("platforms", [])})
+                previous = dict(candidates.get(candidate_id, {}))
+                already_eligible = previous.get("state") == "eligible"
+                unchanged = (
+                    already_eligible
+                    and set(previous.get("capabilities", [])) == set(capabilities)
+                    and set(previous.get("tools", [])) == set(tools)
+                    and set(previous.get("platforms", [])) == set(platforms)
+                )
+                if unchanged:
+                    accepted.append(
+                        {
+                            "agent_id": candidate_id,
+                            "state": "eligible",
+                            "probe_id": None,
+                        }
+                    )
+                    continue
+                candidate = {
+                    **previous,
+                    "state": "testing",
+                    "capabilities": capabilities,
+                    "tools": tools,
+                    "platforms": platforms,
+                    "hardware": dict(raw.get("hardware", {})),
+                    "discovered_by": harness_id,
+                    "probe_task": str(raw.get("probe_task", "")).strip(),
+                    "probe_count": int(previous.get("probe_count", 0)),
+                    "probe_successes": int(previous.get("probe_successes", 0)),
+                    "probe_failures": int(previous.get("probe_failures", 0)),
+                }
+                candidates[candidate_id] = candidate
+                description = candidate["probe_task"] or (
+                    f"在当前 Harness 内验证新发现 Agent {candidate_id} 的能力："
+                    f"{', '.join(capabilities) or '基础任务执行'}。"
+                    "请返回 success、latency_ms 和 failure_type。"
+                )
+                probe = self._ensure_background_probe(
+                    parent,
+                    payload={"probe_task": description},
+                    kind="agent_discovery",
+                    candidate_id=candidate_id,
+                )
+                accepted.append(
+                    {
+                        "agent_id": candidate_id,
+                        "state": "testing",
+                        "probe_id": probe.probe_id if probe else None,
+                    }
+                )
+            metadata["discovery_candidates"] = candidates
+            parent.metadata = metadata
+            self.registry.register(parent, heartbeat_required=True)
+            self._refresh_router()
+            return {
+                "harness_id": harness_id,
+                "accepted": accepted,
+                "routing_effect": "capabilities_enter_foreground_after_probe_success",
+            }
+
     def heartbeat(self, payload: dict[str, Any]) -> ExecutionUnit:
         unit_id = str(payload.get("unit_id", ""))
         if not unit_id:
@@ -321,6 +438,8 @@ class PhaseOneController:
         *,
         payload: dict[str, Any] | None = None,
         attempt: int = 1,
+        kind: str = "onboarding",
+        candidate_id: str | None = None,
     ) -> BackgroundProbe | None:
         with self.lock:
             active = [
@@ -328,6 +447,10 @@ class PhaseOneController:
                 for probe in self.background_probes.values()
                 if probe.unit_id == unit.unit_id
                 and probe.status in {"queued", "running"}
+                and (
+                    (candidate_id is None and probe.kind == kind)
+                    or probe.candidate_id == candidate_id
+                )
             ]
             if active:
                 return active[0]
@@ -351,6 +474,8 @@ class PhaseOneController:
                 lease_id=uuid.uuid4().hex,
                 attempt=attempt,
                 created_at=now,
+                kind=kind,
+                candidate_id=candidate_id,
             )
             self.background_probes[probe.probe_id] = probe
             self.background_queues.setdefault(unit.unit_id, queue.Queue()).put(
@@ -364,12 +489,21 @@ class PhaseOneController:
             unit = self.router.units.get(unit_id)
             if unit is None:
                 raise ValueError("unknown execution unit")
-            if unit.state != "testing":
+            probe_queue = self.background_queues.setdefault(unit_id, queue.Queue())
+            # A foreground Harness may still have discovery probes. Peek at
+            # the queue so those probes can run without exposing onboarding
+            # probes for an already eligible unit.
+            with probe_queue.mutex:
+                queued_probe_id = probe_queue.queue[0] if probe_queue.queue else None
+            if queued_probe_id is None:
+                return None
+            queued_probe = self.background_probes.get(queued_probe_id)
+            if unit.state != "testing" and (
+                queued_probe is None or queued_probe.kind != "agent_discovery"
+            ):
                 return None
             try:
-                probe_id = self.background_queues.setdefault(
-                    unit_id, queue.Queue()
-                ).get_nowait()
+                probe_id = probe_queue.get_nowait()
             except queue.Empty:
                 return None
             probe = self.background_probes[probe_id]
@@ -385,6 +519,8 @@ class PhaseOneController:
                 "description": probe.description,
                 "background": True,
                 "unit_id": unit_id,
+                "kind": probe.kind,
+                "candidate_id": probe.candidate_id,
             }
 
     def complete_background_probe(
@@ -411,6 +547,79 @@ class PhaseOneController:
             probe.status = "completed" if success else "failed"
 
             unit = self.registry.get(probe.unit_id)
+            if probe.kind == "agent_discovery":
+                metadata = dict(unit.metadata)
+                candidates = dict(metadata.get("discovery_candidates", {}))
+                candidate = dict(candidates.get(probe.candidate_id or "", {}))
+                if not candidate:
+                    raise KeyError(f"discovered_agent_not_found:{probe.candidate_id}")
+                count = int(candidate.get("probe_count", 0)) + 1
+                successes = int(candidate.get("probe_successes", 0)) + int(success)
+                failures = int(candidate.get("probe_failures", 0)) + int(not success)
+                history = list(candidate.get("probe_history", []))
+                history.append(
+                    {
+                        "probe_id": probe.probe_id,
+                        "attempt": probe.attempt,
+                        "success": success,
+                        "latency_ms": outcome.get("latency_ms"),
+                        "failure_type": outcome.get("failure_type"),
+                        "timestamp": probe.completed_at,
+                    }
+                )
+                candidate.update(
+                    {
+                        "probe_count": count,
+                        "probe_successes": successes,
+                        "probe_failures": failures,
+                        "probe_history": history[-20:],
+                        "confidence": round(successes / max(1, count), 4),
+                    }
+                )
+                if success:
+                    candidate["state"] = "eligible"
+                    eligible_capabilities = set(
+                        metadata.get("discovered_capabilities", [])
+                    )
+                    eligible_tools = set(metadata.get("discovered_tools", []))
+                    eligible_capabilities.update(candidate.get("capabilities", []))
+                    eligible_tools.update(candidate.get("tools", []))
+                    for item in candidates.values():
+                        if item.get("state") == "eligible":
+                            eligible_capabilities.update(item.get("capabilities", []))
+                            eligible_tools.update(item.get("tools", []))
+                    unit.capabilities.update(candidate.get("capabilities", []))
+                    unit.tools.update(candidate.get("tools", []))
+                    metadata["discovered_capabilities"] = sorted(eligible_capabilities)
+                    metadata["discovered_tools"] = sorted(eligible_tools)
+                elif probe.attempt < self.probe_max_attempts:
+                    candidate["state"] = "testing"
+                else:
+                    candidate["state"] = "rejected"
+                candidates[probe.candidate_id or ""] = candidate
+                metadata["discovery_candidates"] = candidates
+                unit.metadata = metadata
+                self.registry.register(unit, heartbeat_required=True)
+                self._refresh_router()
+                if candidate["state"] == "testing":
+                    self._ensure_background_probe(
+                        unit,
+                        payload={"probe_task": probe.description},
+                        attempt=probe.attempt + 1,
+                        kind="agent_discovery",
+                        candidate_id=probe.candidate_id,
+                    )
+                return {
+                    "probe": asdict(probe),
+                    "unit": serialize_unit(unit),
+                    "candidate": {
+                        "agent_id": probe.candidate_id,
+                        "state": candidate["state"],
+                        "probe_count": candidate["probe_count"],
+                        "confidence": candidate["confidence"],
+                    },
+                }
+
             metadata = dict(unit.metadata)
             count = int(metadata.get("probe_count", 0)) + 1
             successes = int(metadata.get("probe_successes", 0)) + int(success)
@@ -1046,6 +1255,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 unit = CONTROLLER.register_unit(self._read_json())
                 self._json({"registered": True, "unit": serialize_unit(unit)}, status=201)
+                return
+            if parsed.path in ("/harness/discover", "/registry/discover"):
+                if not self._require_registry_token():
+                    return
+                result = CONTROLLER.discover_agents(self._read_json())
+                self._json(result, status=202)
                 return
             if parsed.path == "/registry/heartbeat":
                 if not self._require_registry_token():

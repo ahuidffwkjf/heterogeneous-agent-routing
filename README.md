@@ -63,6 +63,7 @@ POST /tasks
 | `test_execution_units.json` | 测试专用的最小执行单元配置 |
 | `archive/early_mac_iphone/` | 早期 Mac/iPhone 原型归档 |
 | `reports/early_mac_iphone_experiment.md` | 早期实验报告 |
+| `文章/phase1_dsh_cubesandbox_experiment.md` | 当前 ECS + DSH + CubeSandbox 第一阶段实验报告 |
 
 运行后生成的 `registry.db`、令牌、日志和 MicroVM 快照不会提交到 Git。
 
@@ -225,6 +226,42 @@ python3 dsh_agent.py \
 
 新加入且不在初始配置中的 Adapter 会自动进入后台测试模式。Adapter 会从 `/background/tasks/next` 拉取 Canary Task；测试成功后，Controller 才会把它切换为前台可调度状态。
 
+Harness 在运行过程中发现新的内部 Agent 时，不能直接把它加入全局路由。应由 Harness 向 Controller 报告一个候选摘要：
+
+```bash
+curl -X POST http://127.0.0.1:8081/harness/discover \
+  -H 'Content-Type: application/json' \
+  -H "X-Registry-Token: $REGISTRY_TOKEN" \
+  -d '{
+    "harness_id": "dsh_harness_01",
+    "agents": [{
+      "agent_id": "vision-agent-01",
+      "platforms": ["linux"],
+      "capabilities": ["image_inference"],
+      "tools": ["python"],
+      "hardware": {"gpu": true},
+      "probe_task": "验证新发现 Agent 能完成一项图像推理任务"
+    }]
+  }'
+```
+
+Controller 处理流程为：
+
+```text
+Harness 发现 Agent
+    ↓
+候选状态 testing / background-only
+    ↓
+父 Harness 从 /background/tasks/next 获取 Canary Task
+    ↓
+成功：候选变为 eligible，能力汇总到父 Harness 的前台能力
+失败：继续测试，或标记 rejected
+    ↓
+Router 才能选择具备新能力的父 Harness
+```
+
+Agent 的内部身份不会暴露给全局 Router；Router 仍然只选择 Harness。已进入前台的 Harness 也会继续轮询后台发现测试，因此后台验证不会阻塞已有的前台任务。
+
 ## 自动路由示例
 
 任务只填写描述，不填写执行单元：
@@ -374,8 +411,10 @@ python3 -m unittest -v \
 1. 用 Mock Backend 完成 Router、Controller、Registry 和 MicroVM Pool 的协调验证；
 2. 在 ECS 上运行统一 DSH Harness，并用插件制造能力差异；
 3. 在 ECS 上切换到 CubeSandbox Backend，并验证真实 Sandbox 的创建、销毁和补池；
-4. 引入 World Model，预测任务需求、Harness 成功率、延迟和资源状态；
-5. 在多节点和故障注入场景下进行正式对比实验。
+4. 通过蒸馏将 World Model 的预测能力整合进 TaskParser，让系统自主组建 Agent Team，并在失败时返回结构化失败原因；
+5. 使用一致性哈希为主 Agent Team 建立副 Agent Team，将必要数据和上下文同步到副本，支持主 Team 失败后的快速接管；
+6. 使用脱敏 Trace Replay、合成 Canary 和真实 Shadow Task 加速新 Agent 的后台准入；
+7. 在多节点和故障注入场景下进行正式对比实验。
 
 ## 当前版本边界
 

@@ -359,7 +359,15 @@ class DSHAgent:
                 self.state = "idle"
                 self.load = 0.0
                 self.heartbeat()
-                task = self.poll(background=self.background_mode)
+                # A foreground Harness may discover a new internal Agent at
+                # runtime. Keep polling the background lane even after the
+                # parent Harness is eligible, then fall back to user work.
+                task = self.poll(background=True)
+                task_is_background = task is not None
+                if task is None and not self.background_mode:
+                    task = self.poll(background=False)
+                elif task is None:
+                    task = None
                 if task is None:
                     self._stop.wait(self.poll_interval)
                     continue
@@ -367,7 +375,7 @@ class DSHAgent:
                 self.load = 1.0
                 self.heartbeat()
                 outcome = self.execute(task)
-                if self.background_mode:
+                if task_is_background:
                     self.complete_probe(task, outcome)
                 else:
                     self.complete(task, outcome)

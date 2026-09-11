@@ -71,6 +71,42 @@ class ControllerHttpTests(unittest.TestCase):
         self.assertEqual(task["job_id"], created["job_id"])
         self.assertEqual(completed["status"], "completed")
 
+    def test_harness_discovery_enters_background_probe_lane(self):
+        token = controller_module.CONTROLLER.registry_token
+        request = Request(
+            self.base + "/harness/discover",
+            data=json.dumps(
+                {
+                    "harness_id": "dsh_test_mobile_01",
+                    "agents": [
+                        {
+                            "agent_id": "http-discovered-agent",
+                            "platforms": ["ios"],
+                            "capabilities": ["image_inference"],
+                            "tools": ["python"],
+                        }
+                    ],
+                }
+            ).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Registry-Token": token,
+            },
+            method="POST",
+        )
+        with urlopen(request) as response:
+            discovery = json.load(response)
+
+        with urlopen(
+            self.base + "/background/tasks/next?unit_id=dsh_test_mobile_01"
+        ) as response:
+            probe = json.load(response)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(discovery["accepted"][0]["state"], "testing")
+        self.assertEqual(probe["kind"], "agent_discovery")
+        self.assertEqual(probe["candidate_id"], "http-discovered-agent")
+
 
 if __name__ == "__main__":
     unittest.main()
