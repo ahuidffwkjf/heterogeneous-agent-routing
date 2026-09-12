@@ -1,6 +1,6 @@
 # 异构 Agent Router：DeepSeek Harness + MicroVM
 
-> 当前版本：控制面原型 v0.3（DSH Harness、MicroVM Pool、前后台测试隔离与故障恢复）
+> 当前版本：控制面原型 v0.4（DSH Harness、MicroVM Pool、前后台测试隔离、MicroVM 后台准入与故障恢复）
 
 这是一个面向异构 Agent Harness 的实验原型。用户只提交自然语言任务，系统自动完成 Harness 选择、MicroVM 分配、执行和故障恢复。
 
@@ -29,6 +29,8 @@ flowchart LR
 主目录只保留当前 DSH + MicroVM 主线。Mac/iPhone 是早期概念验证，已单独放入 [`archive/early_mac_iphone/`](archive/early_mac_iphone/)，实验过程见 [`reports/early_mac_iphone_experiment.md`](reports/early_mac_iphone_experiment.md)。
 
 完整的生命周期说明见 [`docs/architecture_v2.md`](docs/architecture_v2.md)。
+
+当前阶段性调研报告见 [`reports/current_system_research_report.md`](reports/current_system_research_report.md)。报告明确区分了已实现的确定性路由基线与后续计划中的 Monte Carlo、世界模型和主动信息获取方法。
 
 ## 核心流程
 
@@ -138,6 +140,8 @@ Adapter 使用 DSH 官方 headless 调用形式：
 ```bash
 dsh --profile headless "任务描述"
 ```
+
+当前 Router 还没有世界模型或 Monte Carlo 搜索，使用的是“TaskParser 关键词推断 + 硬约束过滤 + 静态字段/实时负载加权评分”的确定性基线。`success_rate`、`quality_score` 和 `avg_latency_ms` 目前主要来自注册配置，后续将通过 Trace 和真实执行结果更新。
 
 如果要模拟三个 Harness，可以分别启动三个 Adapter，并使用各自的 `--unit-id`、能力和插件参数。默认 `microvm_pool.py` 使用 `MockMicroVMBackend`，本地测试不会创建真实虚拟机。
 
@@ -261,6 +265,8 @@ Router 才能选择具备新能力的父 Harness
 ```
 
 Agent 的内部身份不会暴露给全局 Router；Router 仍然只选择 Harness。已进入前台的 Harness 也会继续轮询后台发现测试，因此后台验证不会阻塞已有的前台任务。
+
+后台 Probe 与前台任务一样会从 MicroVM Pool 租用 `microvm_id`。Probe 完成后销毁本次 MicroVM 并补充 READY 余额；如果暂时没有容量，Probe 保持排队，不会被错误标记为执行失败。
 
 ## 自动路由示例
 
@@ -402,7 +408,7 @@ python3 -m unittest -v \
   test_microvm_pool.py
 ```
 
-测试覆盖任务需求解析、硬约束路由、动态注册、心跳与掉线、任务重试、旧租约拒绝、Controller 重启恢复、MicroVM 预热/销毁/补池以及逻辑跨节点快照恢复。
+测试覆盖任务需求解析、硬约束路由、动态注册、心跳与掉线、任务重试、旧租约拒绝、Controller 重启恢复、前后台准入、后台 Probe MicroVM 租约、MicroVM 预热/销毁/补池以及逻辑跨节点快照恢复。
 
 ## 研究路线
 
@@ -411,10 +417,11 @@ python3 -m unittest -v \
 1. 用 Mock Backend 完成 Router、Controller、Registry 和 MicroVM Pool 的协调验证；
 2. 在 ECS 上运行统一 DSH Harness，并用插件制造能力差异；
 3. 在 ECS 上切换到 CubeSandbox Backend，并验证真实 Sandbox 的创建、销毁和补池；
-4. 通过蒸馏将 World Model 的预测能力整合进 TaskParser，让系统自主组建 Agent Team，并在失败时返回结构化失败原因；
-5. 使用一致性哈希为主 Agent Team 建立副 Agent Team，将必要数据和上下文同步到副本，支持主 Team 失败后的快速接管；
+4. 先实现 Monte Carlo Rollout，作为确定性 Router 到世界模型之间的过渡方法；
+5. 通过蒸馏将 World Model 的预测能力整合进 TaskParser，并让它学习哪些 Agent 信息对当前任务最重要；
 6. 使用脱敏 Trace Replay、合成 Canary 和真实 Shadow Task 加速新 Agent 的后台准入；
-7. 在多节点和故障注入场景下进行正式对比实验。
+7. 使用一致性哈希为主 Agent Team 建立副 Agent Team，支持主 Team 失败后的快速接管；
+8. 在多节点和故障注入场景下进行正式对比实验。
 
 ## 当前版本边界
 

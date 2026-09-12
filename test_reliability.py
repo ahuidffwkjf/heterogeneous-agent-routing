@@ -69,7 +69,10 @@ class ReliabilityTests(unittest.TestCase):
                 "capabilities": ["new_capability"],
                 "tools": ["dsh"],
                 "state": "idle",
-                "metadata": {"transport": "poll"},
+                "metadata": {
+                    "transport": "poll",
+                    "sandbox": {"type": "microvm", "profile": "dsh-test"},
+                },
                 "heartbeat_required": True,
             }
         )
@@ -90,6 +93,7 @@ class ReliabilityTests(unittest.TestCase):
 
         probe = self.controller.next_background_probe("new_dsh_harness_01")
         self.assertIsNotNone(probe)
+        self.assertIsNotNone(probe["microvm_id"])
         result = self.controller.complete_background_probe(
             probe["probe_id"],
             {"success": True, "latency_ms": 12.0, "executor": "new_dsh_harness_01"},
@@ -98,6 +102,13 @@ class ReliabilityTests(unittest.TestCase):
         )
         self.assertEqual(result["unit"]["state"], "idle")
         self.assertEqual(result["unit"]["metadata"]["routing_scope"], "foreground")
+        self.assertEqual(
+            result["probe"]["result"]["sandbox"]["lifecycle"],
+            "destroyed_after_background_success",
+        )
+        profile_vms = self.controller.microvm_pool.snapshot()["profiles"]["dsh-test"]
+        self.assertTrue(profile_vms)
+        self.assertTrue(all(vm["state"] == "ready" for vm in profile_vms))
 
         job = self.controller.submit(
             {
@@ -107,6 +118,54 @@ class ReliabilityTests(unittest.TestCase):
             }
         )
         self.assertEqual(job.selected_unit, "new_dsh_harness_01")
+
+    def test_failed_background_harness_can_reenter_testing_after_reconnect(self):
+        payload = {
+            "unit_id": "recoverable_dsh_harness",
+            "unit_type": "harness",
+            "platforms": ["linux"],
+            "capabilities": ["recoverable_capability"],
+            "tools": ["dsh"],
+            "state": "idle",
+            "metadata": {
+                "transport": "poll",
+                "sandbox": {"type": "microvm", "profile": "dsh-retry"},
+            },
+            "heartbeat_required": True,
+        }
+        self.controller.register_unit(payload)
+
+        for _ in range(3):
+            probe = self.controller.next_background_probe("recoverable_dsh_harness")
+            self.assertIsNotNone(probe)
+            self.assertIsNotNone(probe["microvm_id"])
+            self.controller.complete_background_probe(
+                probe["probe_id"],
+                {
+                    "success": False,
+                    "failure_type": "synthetic_probe_failure",
+                    "executor": "recoverable_dsh_harness",
+                },
+                lease_id=probe["lease_id"],
+                reported_unit_id="recoverable_dsh_harness",
+            )
+
+        failed = self.controller.registry.get("recoverable_dsh_harness")
+        self.assertEqual(failed.state, "degraded")
+        self.assertEqual(failed.metadata["onboarding_status"], "probe_failed")
+
+        self.controller.register_unit(payload)
+        retrying = self.controller.registry.get("recoverable_dsh_harness")
+        self.assertEqual(retrying.state, "testing")
+        retry_probe = self.controller.next_background_probe("recoverable_dsh_harness")
+        self.assertIsNotNone(retry_probe["microvm_id"])
+        result = self.controller.complete_background_probe(
+            retry_probe["probe_id"],
+            {"success": True, "executor": "recoverable_dsh_harness"},
+            lease_id=retry_probe["lease_id"],
+            reported_unit_id="recoverable_dsh_harness",
+        )
+        self.assertEqual(result["unit"]["state"], "idle")
 
     def test_harness_discovered_agent_is_background_tested_before_routing(self):
         discovery = self.controller.discover_agents(

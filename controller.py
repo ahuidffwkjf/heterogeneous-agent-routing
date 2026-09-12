@@ -131,6 +131,10 @@ class BackgroundProbe:
     completed_at: float | None = None
     kind: str = "onboarding"  # onboarding | agent_discovery
     candidate_id: str | None = None
+    microvm_id: str | None = None
+    microvm_profile: str | None = None
+    microvm_node_id: str | None = None
+    microvm_runtime_version: str | None = None
 
 
 class PhaseOneController:
@@ -293,17 +297,35 @@ class PhaseOneController:
                 "probe_successes": 0,
                 "probe_failures": 0,
             }
-        elif existing and existing.state == "testing" and should_onboard:
+        elif existing and should_onboard and (
+            existing.state == "testing"
+            or existing.metadata.get("onboarding_status") == "probe_failed"
+        ):
             # Re-registration must not accidentally promote a unit merely
             # because its adapter reports an idle process state.
             unit.state = "testing"
+            retrying_after_failure = (
+                existing.metadata.get("onboarding_status") == "probe_failed"
+            )
             unit.metadata = {
                 **unit.metadata,
                 "routing_scope": "background",
                 "onboarding_status": "testing",
-                "probe_count": existing.metadata.get("probe_count", 0),
-                "probe_successes": existing.metadata.get("probe_successes", 0),
-                "probe_failures": existing.metadata.get("probe_failures", 0),
+                "probe_count": (
+                    0
+                    if retrying_after_failure
+                    else existing.metadata.get("probe_count", 0)
+                ),
+                "probe_successes": (
+                    0
+                    if retrying_after_failure
+                    else existing.metadata.get("probe_successes", 0)
+                ),
+                "probe_failures": (
+                    0
+                    if retrying_after_failure
+                    else existing.metadata.get("probe_failures", 0)
+                ),
             }
         heartbeat_required = bool(payload.get("heartbeat_required", True))
         self.registry.register(unit, heartbeat_required=heartbeat_required)
@@ -509,8 +531,32 @@ class PhaseOneController:
             probe = self.background_probes[probe_id]
             if probe.status != "queued":
                 return None
+
+            # Foreground jobs obtain their MicroVM in _dispatch. Background
+            # Canary tasks must follow the same lifecycle; otherwise a Cube
+            # backed Adapter receives no microvm_id and fails closed with
+            # missing_microvm_lease.
+            profile = self._microvm_profile(unit)
+            vm = None
+            if profile:
+                try:
+                    vm = self.microvm_pool.reserve(
+                        profile,
+                        f"probe-{probe.probe_id}",
+                    )
+                except Exception:
+                    # Keep the probe queued so a later poll can retry after
+                    # the pool is replenished or capacity becomes available.
+                    probe_queue.put(probe_id)
+                    return None
+
             probe.status = "running"
             probe.started_at = time.time()
+            if vm is not None:
+                probe.microvm_id = vm.vm_id
+                probe.microvm_profile = vm.profile
+                probe.microvm_node_id = vm.node_id
+                probe.microvm_runtime_version = vm.runtime_version
             return {
                 "probe_id": probe.probe_id,
                 "lease_id": probe.lease_id,
@@ -521,7 +567,38 @@ class PhaseOneController:
                 "unit_id": unit_id,
                 "kind": probe.kind,
                 "candidate_id": probe.candidate_id,
+                "microvm_id": probe.microvm_id,
+                "microvm_profile": probe.microvm_profile,
+                "microvm_node_id": probe.microvm_node_id,
+                "microvm_runtime_version": probe.microvm_runtime_version,
             }
+
+    def _release_background_probe_vm(
+        self,
+        probe: BackgroundProbe,
+        outcome: dict[str, Any],
+    ) -> None:
+        if not probe.microvm_id:
+            return
+        outcome.setdefault(
+            "sandbox",
+            {
+                "vm_id": probe.microvm_id,
+                "profile": probe.microvm_profile,
+                "node_id": probe.microvm_node_id,
+                "runtime_version": probe.microvm_runtime_version,
+                "lifecycle": (
+                    "destroyed_after_background_success"
+                    if outcome.get("success")
+                    else "destroyed_after_background_failure"
+                ),
+            },
+        )
+        self.microvm_pool.destroy_and_replenish(probe.microvm_id)
+        probe.microvm_id = None
+        probe.microvm_profile = None
+        probe.microvm_node_id = None
+        probe.microvm_runtime_version = None
 
     def complete_background_probe(
         self,
@@ -541,10 +618,12 @@ class PhaseOneController:
                 raise ValueError("probe_unit_mismatch")
             if probe.status in {"completed", "failed"}:
                 return asdict(probe)
-            probe.result = dict(outcome)
+            outcome = dict(outcome)
             probe.completed_at = time.time()
             success = bool(outcome.get("success"))
             probe.status = "completed" if success else "failed"
+            self._release_background_probe_vm(probe, outcome)
+            probe.result = dict(outcome)
 
             unit = self.registry.get(probe.unit_id)
             if probe.kind == "agent_discovery":
