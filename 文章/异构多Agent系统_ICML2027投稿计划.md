@@ -1,6 +1,6 @@
 # 异构多 Agent 系统：ICML 2027 投稿计划（重写版）
 
-> 更新时间：2026 年 9 月 11 日
+> 更新时间：2026 年 9 月 14 日
 > 目标会议：ICML 2027  由于官方尚未公布 2027 年具体投稿日期，本文暂按“2027 年 1 月下旬投稿”倒排；正式日期以 ICML 官方通知为准。参考：[ICML Future Meetings](https://icml.cc/Conferences/FutureMeetings)、[ICML 2026 Dates](https://icml.cc/Conferences/2026/Dates)。
 
 ## 1. 投稿定位
@@ -25,7 +25,7 @@
 
 1. **Harness-level routing**：全局 Router 只选择 Harness，不直接干预 Harness 内部 Agent 或 Agent Team 的协作细节。
 2. **后台准入**：Harness 发现新 Agent 后，先进入后台测试通道；只有测试达标后，才加入全局调度的能力摘要。
-3. **Outcome-aware prediction**：将历史轨迹、实时状态和任务特征用于预测候选 Harness 的成功概率、延迟和风险，并辅助选择。
+3. **Black-box outcome prediction**：不读取内部轨迹，只使用任务特征、Harness 可观测状态和任务级结果预测成功概率、延迟和风险。
 4. **Selective redundancy**：对高风险任务建立主 Agent Team 与副 Agent Team，通过一致性哈希、版本号、租约和幂等机制实现快速接管。
 
 ## 2. 研究边界
@@ -57,7 +57,8 @@ Harness 内部可以自行发现 Agent、组建 Agent Team、决定分工和通�
 | Registry | 保存能力、硬件、心跳、负载、历史统计 | 间接使用 |
 | Harness | 将任务翻译为本地执行动作，发现内部 Agent | 否 |
 | Agent / Agent Team | 执行具体工作，内部如何协作由 Harness 决定 | 否 |
-| MicroVM | 为任务提供隔离、可销毁的运行环境 | 由 Controller / Pool 管理 |
+| Local Runtime | 在用户电脑上启动 Controller 与多个 Harness | 由本地启动器管理 |
+| Sandbox（可选） | 为不可信任务提供额外隔离 | 由 Controller / Pool 管理 |
 
 ## 3. 当前已经完成的系统基础
 
@@ -71,7 +72,7 @@ Controller
    ├── Registry：记录 Harness 能力、硬件、心跳、负载与历史表现
    ├── Router：硬约束过滤 + 候选评分
    ├── Adapter：与 Harness 通信、租约、轮询和状态翻译
-   ├── MicroVM Pool：预热、租用、销毁、补充
+   ├── Local Runtime：一键启动多个黑箱 Harness
    └── Monitor：超时、掉线、失败重试和重新调度
              ↓
         Harness
@@ -85,12 +86,12 @@ Controller
 - Registry 支持 SQLite 本地实验，记录 Harness 的能力、平台、硬件、负载、心跳和质量统计；
 - Router 可以根据任务语义推断需求，并基于硬约束和评分自动选择 Harness；
 - DSH Harness 已接入，当前统一使用 DSH 作为 Harness 运行接口；
-- ECS 上已经接通 CubeSandbox，并通过 PVM Host Kernel、`/dev/kvm` 和 `kvm_pvm` 运行真实 MicroVM；
-- MicroVM Pool 支持预热、租用、任务完成后销毁，并自动补充预热池余额；
-- DSH 凭据可以由 Controller 在创建 MicroVM 时注入，不写入公共 Registry；
+- 已增加无需 ECS、Docker、KVM 或 CubeSandbox 的本地一键启动方式；
+- 零依赖 Mock Harness 可完成端到端功能验证，本机 DSH 模式可执行真实任务；
+- 五个本地 Harness 使用不同能力和插件声明，并通过独立工作目录运行；
 - 已实现 Harness 发现内部 Agent 后的候选登记、后台 Canary 测试和合格后准入；
 - 前台任务通道与后台测试通道隔离，后台测试不阻塞已有 Harness 的前台执行；
-- 已完成一次 ECS + CubeSandbox + DSH 的端到端 Python 测试：4 个 `unittest` 用例全部通过，任务成功后 MicroVM 被销毁并补充新的预热实例；
+- 历史上已完成 ECS + CubeSandbox + DSH 实机验证；该结果作为可选后端证据保留，不再是主实验依赖；
 - 核心 Router、可靠性、HTTP 接口和 Harness Runtime 测试已经具备。
 
 ### 3.3 当前结果的正确表述
@@ -136,7 +137,7 @@ Harness 发现新 Agent
         ↓
 Registry 标记 testing
         ↓
-后台 Canary / Trace Replay / Shadow Task
+后台 Canary / 合成 Probe / Shadow Task
         ↓
 达到准入阈值？
    ├── 否：rejected 或继续观察
@@ -145,23 +146,23 @@ Registry 标记 testing
 
 全局 Router 只看到 Harness 的聚合能力，避免把不稳定的单个新 Agent 直接暴露给用户任务。
 
-### 4.3 Trace Replay 辅助测试
+### 4.3 黑箱 Probe 辅助测试
 
-对于新 Agent，可以根据一致性哈希从 Trace Store 选择与其能力、任务类型和版本匹配的历史轨迹，经过脱敏后在独立 MicroVM 中重放：
+由于 Harness 的内部轨迹、本地模型和私有数据不可见，Controller 不能重放其内部 Trace。系统只能根据历史任务分布生成标准化或合成 Probe，并把任务发送给新 Harness：
 
 ```text
-历史任务轨迹
-   ↓  脱敏 / 去除原始 CoT、API Key、隐私数据
-一致性哈希(task_family, capability, schema_version)
+历史任务的公开 Schema 与任务级 Outcome
+   ↓  抽象 / 合成 / 隐私过滤
+Probe generator(task_family, capability, schema_version)
    ↓
-新 Agent 后台 Shadow Replay
+新 Agent 后台执行 Probe
    ↓
-与基线结果比较，结合 Canary 和真实小流量测试
+只回传成功、延迟、成本、质量和失败类型
    ↓
 更新准入分数与失败原因
 ```
 
-Trace Replay 只用于评估和预测，不应直接把原始用户数据或未脱敏内部推理过程复制给新 Agent。
+一致性哈希仍可用于稳定地把同一任务族映射到 Probe 集或副 Harness，但不能用来传输其他 Harness 的内部轨迹。
 
 ### 4.4 世界模型的定位
 
@@ -201,26 +202,25 @@ World Model 选择主 Team
 
 ### Contribution 2：面向不确定执行结果的预测式调度
 
-将历史 Trace、在线状态和实验反馈蒸馏进 Task Parser / World Model，使 Router 不仅依据静态 capability 匹配，还能根据成功概率、延迟和风险做结果感知决策。
+将任务级 Outcome、在线状态和实验反馈蒸馏进 Task Parser / World Model，使 Router 不仅依据静态 capability 匹配，还能根据成功概率、延迟和风险做结果感知决策。Harness 内部 Agent、消息、思维链、工具调用轨迹、本地模型和私有数据均不可见。
 
 ### Contribution 3：动态准入与风险感知容错
 
-提出“后台测试后准入”的新 Agent 生命周期，并结合 Trace Replay 和主备 Team 一致性哈希，在新 Agent 加入、旧 Agent 掉线和任务执行失败时提高系统鲁棒性。
+提出“后台测试后准入”的新 Agent 生命周期，并结合标准化 Probe、合成 Canary 和主备 Team 一致性哈希，在新 Agent 加入、旧 Agent 掉线和任务执行失败时提高系统鲁棒性。
 
 ## 6. 实验设计
 
 ### 6.1 实验平台
 
-第一阶段使用单台 ECS 模拟多节点逻辑资源：
+第一阶段直接在普通用户电脑上运行：
 
-- Ubuntu 22.04，x86_64；
-- CubeSandbox MicroVM；
-- PVM Host Kernel + `/dev/kvm`；
+- macOS 或 Linux，Python 3.10+；
+- 本地 Controller、SQLite Registry 与五个 Harness 进程；
+- Mock 和本机 DSH 两种执行模式；
 - DSH 作为统一 Harness 运行接口；
-- Controller、Registry、Router、Adapter 和 MicroVM Pool；
-- 通过多个逻辑 Harness、不同插件集合、不同资源画像和随机扰动模拟异构网络。
+- 通过不同插件集合、资源画像和随机扰动模拟异构黑箱网络。
 
-后续若资源允许，再扩展到多台 ECS，以验证跨节点迁移、不同网络条件和真实资源竞争。
+正式主实验以单机多进程确保可复现；真实 GPU、移动设备和多机节点作为外部有效性实验，不构成方法成立的前提。
 
 ### 6.2 任务集合
 
@@ -241,13 +241,13 @@ World Model 选择主 Team
 
 - 心跳延迟或丢失；
 - Harness 临时掉线；
-- MicroVM 冷启动和创建失败；
+- 本地 Harness 启动延迟和进程失败；
 - 网络延迟和请求超时；
 - CPU / 内存负载升高；
 - 新 Agent 中途上线；
 - 新 Agent 初始能力声明不准确；
 - 主 Team 执行中断；
-- Trace Replay 与真实任务分布不一致。
+- Probe Suite 与真实任务分布不一致。
 
 ### 6.4 对比方法
 
@@ -258,7 +258,7 @@ World Model 选择主 Team
 3. Load-aware：能力匹配后选择当前负载最低者；
 4. Historical Score：根据历史成功率和平均延迟选择；
 5. Parser without World Model：使用任务解析和规则，但不做结果预测；
-6. World Model without Trace Replay：有预测，但新 Agent 不使用历史轨迹测试；
+6. World Model without Probe Suite：有预测，但新 Agent 只使用随机测试；
 7. World Model without Backup：有预测，但不启用主备 Team；
 8. Full：完整系统。
 
@@ -267,8 +267,8 @@ World Model 选择主 Team
 | 类别 | 指标 |
 |---|---|
 | 任务结果 | success rate、quality score、failure reason accuracy |
-| 性能 | 平均延迟、P50/P95 延迟、排队时间、MicroVM 冷启动时间 |
-| 资源 | CPU / 内存使用、MicroVM 数量、单位任务成本 |
+| 性能 | 平均延迟、P50/P95 延迟、排队时间、Harness 启动时间 |
+| 资源 | CPU / 内存使用、进程数量、单位任务成本 |
 | 调度 | routing regret、错误路由率、候选过滤准确率 |
 | 新 Agent 准入 | time-to-eligibility、测试开销、误准入率、误拒绝率 |
 | 鲁棒性 | 掉线恢复时间、主备切换时间、任务最终成功率 |
@@ -289,9 +289,9 @@ World Model 选择主 Team
 
 让 Harness 在任务流运行过程中发现新 Agent，比较“立即纳入”和“后台测试后纳入”两种策略的误准入率、任务成功率和准入时间。
 
-#### 实验 D：Trace Replay 的测试效率
+#### 实验 D：黑箱 Probe 的测试效率
 
-比较无历史测试、随机测试、一致性哈希 Trace Replay、Trace Replay + Canary 四种策略，评估达到准入阈值所需的测试成本与泛化能力。
+比较无测试、随机 Canary、合成 Probe、任务分布感知 Probe 四种策略，评估达到准入阈值所需的测试成本与泛化能力。只发送标准化任务并接收任务级指标，不共享内部轨迹。
 
 #### 实验 E：世界模型调度
 
@@ -303,7 +303,7 @@ World Model 选择主 Team
 
 #### 实验 G：联合消融
 
-逐步加入后台准入、Trace Replay、世界模型和主备 Team，展示各模块的边际收益与成本。
+逐步加入后台准入、Probe 策略、世界模型和主备 Team，展示各模块的边际收益与成本。
 
 ## 7. 消融实验与科学问题
 
@@ -312,7 +312,7 @@ World Model 选择主 Team
 1. 动态状态是否比静态 capability 更能解释任务结果？
 2. 世界模型是否能降低错误路由和尾部延迟？
 3. 新 Agent 的后台测试能否降低立即纳入带来的失败？
-4. Trace Replay 是否比随机 Canary 更快发现能力边界？
+4. 任务分布感知 Probe 是否比随机 Canary 更快发现黑箱能力边界？
 5. 一致性哈希是否能在不显著增加重复计算的情况下缩短故障恢复时间？
 6. 哪些任务值得启用副 Team，冗余成本与可靠性收益如何权衡？
 7. 当任务分布发生变化时，世界模型是否会失效，如何检测和更新？
@@ -322,7 +322,7 @@ World Model 选择主 Team
 - 去掉 World Model；
 - 去掉实时负载和心跳状态；
 - 去掉后台准入；
-- 去掉 Trace Replay；
+- 去掉任务分布感知 Probe；
 - 去掉一致性哈希；
 - 固定副 Team 与风险感知副 Team 对比；
 - 不输出结构化失败原因；
@@ -336,7 +336,7 @@ World Model 选择主 Team
 
 - 冻结论文题目、研究问题和边界；
 - 确定 Harness-level routing 的术语和数据结构；
-- 固定任务 Schema、Trace Schema、失败类型和指标；
+- 固定任务 Schema、Outcome Schema、失败类型和指标；
 - 固定实验日志格式、随机种子和配置版本；
 - 明确当前工程结果与未来方法结果的区别。
 
@@ -344,12 +344,12 @@ World Model 选择主 Team
 
 ### 阶段 1：系统与基准完善（9 月 22 日—10 月 5 日）
 
-- 将至少 3 个 DSH Harness 接入 ECS；
-- 完善 Registry、Controller、Adapter 和 MicroVM Pool 的日志；
+- 在本机稳定运行至少 5 个 DSH/Mock Harness；
+- 完善 Registry、Controller、Adapter 和本地运行日志；
 - 完成前台任务与后台测试任务隔离；
 - 完成新 Agent 发现、候选状态机和准入阈值；
-- 建立 Trace Store、脱敏和 Replay 接口；
-- 加入可重复的延迟、掉线、负载和 MicroVM 故障注入。
+- 建立只含任务级反馈的 Outcome Store；
+- 加入可重复的延迟、掉线、负载和进程故障注入。
 
 **交付物**：可重复运行的实验脚本、基准任务集、故障注入模块。
 
@@ -362,14 +362,14 @@ World Model 选择主 Team
 
 **阶段门槛**：如果基线数据不可复现，暂停模型开发，先修复日志和实验控制。
 
-### 阶段 3：Trace Replay 与新 Agent 准入（10 月 27 日—11 月 9 日）
+### 阶段 3：黑箱 Probe 与新 Agent 准入（10 月 27 日—11 月 9 日）
 
-- 收集并脱敏历史 Trace；
-- 实现一致性哈希分桶和 Shadow Replay；
-- 比较立即纳入、随机 Canary、Trace Replay 和组合策略；
+- 收集任务级 Outcome，不收集内部 Trace；
+- 从历史任务分布生成脱敏、合成的 Probe Suite；
+- 比较立即纳入、随机 Canary、分布感知 Probe 和组合策略；
 - 估计测试数量、准入时间和误准入率之间的权衡。
 
-**交付物**：新 Agent 准入实验结果和 Trace Replay 消融结果。
+**交付物**：新 Agent 准入实验结果和黑箱 Probe 消融结果。
 
 ### 阶段 4：世界模型与预测式调度（11 月 10 日—11 月 30 日）
 
@@ -420,15 +420,15 @@ World Model 选择主 Team
 
 ### 2. Problem Formulation and System Model
 
-定义任务、Harness、内部 Agent/Team、状态、Trace、执行结果和调度目标，明确全局 Router 不暴露 Harness 内部协作。
+定义任务、Harness、内部 Agent/Team、可观测状态、任务级 Outcome 和调度目标，明确全局 Router 不获取 Harness 内部协作轨迹。
 
 ### 3. Method
 
-介绍约束优先路由、后台准入、Trace Replay、世界模型预测和选择性主备 Team。
+介绍约束优先路由、黑箱 Probe 准入、世界模型预测和选择性主备 Team。
 
 ### 4. Experimental Platform and Benchmark
 
-介绍 ECS、CubeSandbox、MicroVM、DSH Harness、任务族、动态扰动和可复现实验协议。
+介绍本地多进程 DSH/Mock Harness、任务族、动态扰动和可复现实验协议；云端沙箱仅作为可选外部验证。
 
 ### 5. Results
 
@@ -436,7 +436,7 @@ World Model 选择主 Team
 
 ### 6. Analysis and Limitations
 
-分析预测失效、Trace 分布偏移、MicroVM 成本、主备冗余开销、真实多节点扩展限制和隐私保护问题。
+分析预测失效、Probe 分布偏移、本地资源竞争、主备冗余开销、真实多节点扩展限制和隐私保护问题。
 
 ### 7. Conclusion
 
@@ -452,11 +452,11 @@ World Model 选择主 Team
 
 不默认复制全部任务，只对高风险、高价值或不可重试任务启用副 Team，并报告冗余计算成本。
 
-### 风险 3：Trace Replay 泛化不足
+### 风险 3：Probe 泛化不足
 
-将 Replay 定位为后台筛选工具，而不是最终性能保证；继续保留真实 Canary 和小流量 Shadow Task。
+将 Probe 定位为后台筛选工具，而不是最终性能保证；继续保留真实 Canary 和小流量 Shadow Task。
 
-### 风险 4：单 ECS 规模有限
+### 风险 4：单机实验规模有限
 
 论文中明确区分“逻辑多 Harness 并发实验”和“真实多物理节点实验”，不能把逻辑隔离直接宣称为完整集群结论。
 
@@ -466,9 +466,9 @@ World Model 选择主 Team
 
 ## 11. 当前最优先的下一步
 
-1. 把现有成功的 ECS + CubeSandbox + DSH 运行过程整理成固定实验脚本；
-2. 为 3 个逻辑 DSH Harness 增加可控的延迟、掉线、负载和成功率参数；
-3. 固定 Trace Schema、脱敏规则和 Replay 数据划分；
+1. 固定本地一键启动与零依赖端到端冒烟测试；
+2. 为 5 个本地 DSH/Mock Harness 增加可控的延迟、掉线、负载和成功率参数；
+3. 固定 Outcome Schema、黑箱边界和 Probe 数据划分；
 4. 完成“立即纳入新 Agent”与“后台测试后纳入”的第一组对照实验；
 5. 建立第一版基线结果，暂时不加入复杂世界模型；
 6. 基于真实日志决定世界模型预测的标签、输入特征和更新频率；

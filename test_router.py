@@ -1,6 +1,6 @@
 import unittest
 
-from router import ExecutionUnit, NoEligibleUnit, Router, Task
+from router import ExecutionUnit, NoEligibleUnit, Router, Task, TaskParser
 
 
 class RouterTests(unittest.TestCase):
@@ -61,6 +61,32 @@ class RouterTests(unittest.TestCase):
             )
         self.assertIn("mac", context.exception.rejected)
         self.assertIn("gpu_team", context.exception.rejected)
+
+    def test_parser_does_not_turn_camera_into_ios_constraint(self):
+        inferred = TaskParser.infer("调用摄像头拍照并保存")
+        self.assertIn("camera", inferred["required_capabilities"])
+        self.assertFalse(inferred["requires_mobile"])
+        self.assertEqual(inferred["allowed_platforms"], set())
+
+    def test_parser_respects_negated_gpu_requirement(self):
+        inferred = TaskParser.infer("用 Python 做图像推理，不需要 GPU")
+        self.assertFalse(inferred["requires_gpu"])
+        self.assertNotIn("gpu", inferred["required_capabilities"])
+        self.assertNotIn("gpu", inferred["preferred_capabilities"])
+
+    def test_parser_extracts_risk_privacy_and_objective_preferences(self):
+        inferred = TaskParser.infer("紧急处理不能上传的医疗数据，要求结果准确")
+        self.assertEqual(inferred["privacy_level"], "high")
+        self.assertEqual(inferred["risk_level"], "high")
+        self.assertIn("data_locality", inferred["required_capabilities"])
+        self.assertGreaterEqual(inferred["objective_weights"]["latency"], 0.35)
+        self.assertGreaterEqual(inferred["objective_weights"]["quality"], 0.4)
+
+    def test_policy_prompt_describes_black_box_boundary(self):
+        prompt = TaskParser.policy_prompt("生成报告")
+        self.assertIn("Harness 是黑箱", prompt)
+        self.assertIn("否定表达", prompt)
+        self.assertIn("用户任务：生成报告", prompt)
 
 
 if __name__ == "__main__":

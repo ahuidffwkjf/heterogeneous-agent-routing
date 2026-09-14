@@ -1,9 +1,7 @@
-"""Run one DeepSeek Harness instance as a polling execution unit.
+"""Run one local or remote DeepSeek Harness as a polling execution unit.
 
-This adapter is intended to run inside one MicroVM.  It keeps the global
-Controller reachable through outbound HTTP only, so the Controller does not
-need to open a callback port inside the VM.  The actual work is delegated to
-the official DSH headless profile:
+The default mode runs on the user's own computer and needs no ECS.  The actual
+work can be delegated to the official DSH headless profile:
 
     dsh --profile headless "task text"
 
@@ -19,8 +17,10 @@ import argparse
 import inspect
 import json
 import os
+import platform
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from http.client import HTTPResponse
@@ -28,6 +28,51 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+
+def local_platforms() -> list[str]:
+    """Return normalized platform labels without exposing host details."""
+    if sys.platform == "darwin":
+        return ["local", "macos"]
+    if sys.platform.startswith("linux"):
+        return ["local", "linux"]
+    if sys.platform.startswith("win"):
+        return ["local", "windows"]
+    return ["local", sys.platform]
+
+
+def build_execution_prompt(
+    task: dict[str, Any],
+    *,
+    unit_id: str,
+    capabilities: list[str],
+    plugins: list[str],
+) -> str:
+    """Build the black-box Harness contract sent to DSH.
+
+    The Controller deliberately asks only for task-level output and failure
+    evidence.  Internal Agent identities, messages, reasoning traces, local
+    model parameters, and private data must remain inside the Harness.
+    """
+    description = str(task.get("description", "")).strip()
+    inferred = task.get("inferred_requirements", {})
+    return "\n".join(
+        [
+            "你是一个自治的黑箱 Harness。请完成以下任务。",
+            f"任务：{description}",
+            f"当前 Harness：{unit_id}",
+            f"声明能力：{', '.join(capabilities) or '未声明'}",
+            f"已装插件：{', '.join(plugins) or '未声明'}",
+            f"路由推断：{json.dumps(inferred, ensure_ascii=False)}",
+            "执行规则：",
+            "1. 只使用当前 Harness 实际具备的能力，不虚构工具、设备、文件或执行结果。",
+            "2. Harness 内部可自行选择 Agent、组建 Agent Team 并安排分工，无需公开内部结构。",
+            "3. 不要返回思维链、内部消息、私有数据、模型参数或完整执行轨迹。",
+            "4. 成功时返回最终产物和必要的可验证摘要。",
+            "5. 失败时必须明确报告 failure_type、失败阶段、直接原因以及是否适合重试。",
+            "6. 若任务与声明能力不匹配，立即失败并说明 missing_capability，不要假装完成。",
+        ]
+    )
 
 
 def request_json(
@@ -80,6 +125,7 @@ class DSHAgent:
         tools: list[str],
         plugins: list[str],
         workspace: str,
+        platforms: list[str] | None = None,
         dsh_bin: str = "dsh",
         execution_mode: str = "host",
         cube_api_url: str = "http://127.0.0.1:3000",
@@ -97,6 +143,7 @@ class DSHAgent:
         self.tools = tools
         self.plugins = plugins
         self.workspace = workspace
+        self.platforms = platforms or local_platforms()
         self.dsh_bin = dsh_bin
         self.execution_mode = execution_mode
         self.cube_api_url = cube_api_url.rstrip("/")
@@ -111,10 +158,32 @@ class DSHAgent:
         self._stop = threading.Event()
 
     def registration_payload(self) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "transport": "poll",
+            "heartbeat_required": True,
+            "harness_type": "deepseek_harness" if self.execution_mode != "mock" else "mock_harness",
+            "runtime": "dsh" if self.execution_mode != "mock" else "mock",
+            "dsh_profile": self.profile,
+            "plugins": self.plugins,
+            "scope": "harness",
+            "isolation": "cube_microvm" if self.execution_mode == "cube" else "local_process",
+            "hardware": {
+                "platform": self.platforms[-1],
+                "architecture": platform.machine() or "unknown",
+                "cpu_cores": os.cpu_count() or 1,
+                "gpu": bool(os.environ.get("CUDA_VISIBLE_DEVICES")),
+            },
+        }
+        if self.execution_mode == "cube":
+            metadata["sandbox"] = {
+                "type": "microvm",
+                "profile": f"dsh-{self.profile}",
+                "runtime_version": os.environ.get("DSH_RUNTIME_VERSION", "dsh-0.1"),
+            }
         return {
             "unit_id": self.unit_id,
             "unit_type": "harness",
-            "platforms": ["linux"],
+            "platforms": self.platforms,
             "capabilities": self.capabilities,
             "tools": self.tools,
             "state": self.state,
@@ -123,25 +192,7 @@ class DSHAgent:
             "quality_score": 0.8,
             "avg_latency_ms": 1000,
             "cost_score": 0.2,
-            "metadata": {
-                "transport": "poll",
-                "heartbeat_required": True,
-                "harness_type": "deepseek_harness",
-                "runtime": "dsh",
-                "dsh_profile": self.profile,
-                "plugins": self.plugins,
-                "scope": "harness",
-                "sandbox": {
-                    "type": "microvm",
-                    "profile": f"dsh-{self.profile}",
-                    "runtime_version": os.environ.get("DSH_RUNTIME_VERSION", "dsh-0.1"),
-                },
-                "hardware": {
-                    "platform": "linux",
-                    "architecture": "x86_64",
-                    "gpu": bool(os.environ.get("CUDA_VISIBLE_DEVICES")),
-                },
-            },
+            "metadata": metadata,
             # Unknown runtime Harnesses are onboarded through the background
             # probe lane. Pre-seeded units keep their configured foreground
             # status when they reconnect.
@@ -158,7 +209,10 @@ class DSHAgent:
         if status != 201:
             raise RuntimeError(f"registration_failed:{status}")
         self._update_mode(body)
-        print(f"Registered DSH Harness {self.unit_id} with profile {self.profile}")
+        print(
+            f"Registered Harness {self.unit_id} "
+            f"with profile {self.profile} ({self.execution_mode})"
+        )
 
     def _update_mode(self, body: dict[str, Any] | None) -> None:
         unit = (body or {}).get("unit", {})
@@ -204,9 +258,27 @@ class DSHAgent:
                 "failure_type": "empty_task_description",
                 "executor": self.unit_id,
             }
+        prompt = build_execution_prompt(
+            task,
+            unit_id=self.unit_id,
+            capabilities=self.capabilities,
+            plugins=self.plugins,
+        )
+        if self.execution_mode == "mock":
+            latency_ms = round((time.perf_counter() - started) * 1000, 3)
+            return {
+                "success": True,
+                "quality": 0.75,
+                "latency_ms": latency_ms,
+                "cost": 0.0,
+                "failure_type": None,
+                "executor": self.unit_id,
+                "output": f"[local mock] 已完成：{description}",
+                "execution_mode": "mock",
+            }
         if self.execution_mode == "cube":
-            return self._execute_in_cube_sandbox(task, description)
-        command = [self.dsh_bin, "--profile", "headless", description]
+            return self._execute_in_cube_sandbox(task, prompt)
+        command = [self.dsh_bin, "--profile", self.profile, prompt]
         try:
             completed = subprocess.run(
                 command,
@@ -247,7 +319,7 @@ class DSHAgent:
     def _execute_in_cube_sandbox(
         self,
         task: dict[str, Any],
-        description: str,
+        prompt: str,
     ) -> dict[str, Any]:
         """Run DSH inside the task MicroVM selected by the Controller.
 
@@ -290,7 +362,7 @@ class DSHAgent:
             )
             sandbox = Sandbox.connect(vm_id, config=Config(**config_kwargs))
             command = shlex.join(
-                [self.dsh_bin, "--profile", self.profile, description]
+                [self.dsh_bin, "--profile", self.profile, prompt]
             )
             result = sandbox.commands.run(command)
             returncode = int(getattr(result, "exit_code", 0) or 0)
@@ -401,12 +473,18 @@ def main() -> None:
     parser.add_argument("--tool", action="append", default=[])
     parser.add_argument("--plugin", action="append", default=[])
     parser.add_argument("--workspace", default="/workspace")
+    parser.add_argument(
+        "--platform",
+        action="append",
+        default=[],
+        help="Override auto-detected local platform labels",
+    )
     parser.add_argument("--dsh-bin", default="dsh")
     parser.add_argument(
         "--execution-mode",
-        choices=("host", "cube"),
+        choices=("host", "mock", "cube"),
         default=os.environ.get("DSH_EXECUTION_MODE", "host"),
-        help="Run DSH on the adapter host or inside the leased CubeSandbox VM",
+        help="Run DSH locally, run a zero-dependency mock, or use optional CubeSandbox",
     )
     parser.add_argument(
         "--cube-api-url",
@@ -437,6 +515,7 @@ def main() -> None:
         tools=args.tool,
         plugins=args.plugin,
         workspace=args.workspace,
+        platforms=args.platform or None,
         dsh_bin=args.dsh_bin,
         execution_mode=args.execution_mode,
         cube_api_url=args.cube_api_url,

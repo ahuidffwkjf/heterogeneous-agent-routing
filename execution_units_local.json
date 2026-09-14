@@ -1,0 +1,94 @@
+{
+  "units": [
+    {
+      "unit_id": "local_docs_harness",
+      "unit_type": "harness",
+      "platforms": ["local"],
+      "capabilities": ["document_generation", "local_file_access", "data_locality"],
+      "tools": ["dsh"],
+      "state": "offline",
+      "success_rate": 0.86,
+      "quality_score": 0.88,
+      "avg_latency_ms": 1100,
+      "cost_score": 0.1,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "plugins": ["file", "document"],
+        "probe_task": "生成一份简短 Markdown 摘要，并明确报告成功或失败原因"
+      }
+    },
+    {
+      "unit_id": "local_code_harness",
+      "unit_type": "harness",
+      "platforms": ["local"],
+      "capabilities": ["code_build", "local_compute", "python", "test_execution", "data_locality"],
+      "tools": ["dsh", "python", "shell"],
+      "state": "offline",
+      "success_rate": 0.9,
+      "quality_score": 0.86,
+      "avg_latency_ms": 850,
+      "cost_score": 0.12,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "plugins": ["python", "shell", "test"],
+        "probe_task": "运行一个不修改用户文件的 Python 单元测试，并返回退出状态"
+      }
+    },
+    {
+      "unit_id": "local_data_harness",
+      "unit_type": "harness",
+      "platforms": ["local"],
+      "capabilities": ["data_processing", "structured_extraction", "python", "database", "data_locality"],
+      "tools": ["dsh", "python", "sqlite"],
+      "state": "offline",
+      "success_rate": 0.87,
+      "quality_score": 0.89,
+      "avg_latency_ms": 950,
+      "cost_score": 0.11,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "plugins": ["python", "data", "structured-output", "sqlite"],
+        "probe_task": "把一小段样例数据转换成结构化 JSON，并验证字段完整性"
+      }
+    },
+    {
+      "unit_id": "local_vision_harness",
+      "unit_type": "harness",
+      "platforms": ["local"],
+      "capabilities": ["camera", "image_inference", "data_locality"],
+      "tools": ["dsh"],
+      "state": "offline",
+      "success_rate": 0.82,
+      "quality_score": 0.84,
+      "avg_latency_ms": 1450,
+      "cost_score": 0.16,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "plugins": ["vision", "image"],
+        "probe_task": "验证当前 Harness 能识别一张本地样例图片；缺少图片时报告 missing_input"
+      }
+    },
+    {
+      "unit_id": "local_research_harness",
+      "unit_type": "harness",
+      "platforms": ["local"],
+      "capabilities": ["web_research", "network_access", "document_generation"],
+      "tools": ["dsh", "web"],
+      "state": "offline",
+      "success_rate": 0.84,
+      "quality_score": 0.9,
+      "avg_latency_ms": 1800,
+      "cost_score": 0.2,
+      "metadata": {
+        "transport": "poll",
+        "heartbeat_required": true,
+        "plugins": ["web", "citation", "document"],
+        "probe_task": "完成一次短网络检索；无法联网时明确报告 network_unavailable"
+      }
+    }
+  ]
+}

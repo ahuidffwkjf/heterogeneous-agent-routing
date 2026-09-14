@@ -1,13 +1,13 @@
 # 异构多 Agent 系统阶段性调研报告
 
-> 版本：Phase 1 / DSH + CubeSandbox
-> 更新时间：2026 年 9 月 12 日
+> 版本：Phase 1 / Local FedHarness
+> 更新时间：2026 年 9 月 14 日
 
 ## 摘要
 
 本项目研究一个面向动态异构 Agent 网络的任务调度系统。用户只提交自然语言任务，系统根据任务需求、Harness 能力、硬件、负载和在线状态自动选择执行 Harness；Harness 内部可以自行发现 Agent、组建 Agent Team 并决定协作方式，全局 Controller 不干预其内部流程。
 
-当前系统已经完成从 Controller、Router、Registry、DSH Adapter 到 CubeSandbox MicroVM 的基本闭环，并在 ECS 上完成了真实 MicroVM 执行验证。当前的路由器仍然是规则和加权评分基线，尚未接入世界模型或 Monte Carlo 搜索。新 Harness 的后台准入、MicroVM 租用与销毁、掉线重试和任务隔离已经成为下一阶段预测式调度的工程基础。
+当前系统已经完成从 Controller、Router、Registry 到本地 DSH Adapter 的基本闭环，并提供不依赖 ECS、Docker、KVM 或 CubeSandbox 的一键本地运行方式。当前路由器仍然是规则和加权评分基线，尚未接入世界模型或 Monte Carlo 搜索。新 Harness 后台准入、掉线重试、任务级结果记录和黑箱边界已经成为下一阶段预测式调度的工程基础。此前 ECS + CubeSandbox 实验保留为可选隔离后端的历史验证，不再是本研究的运行前提。
 
 ## 1. 研究背景
 
@@ -32,9 +32,12 @@
 ```text
 用户任务 → 全局 Router → Harness → 内部 Agent / Agent Team
 ```
+方案描述：
+
+在 多个Harness 动态加入、性能未知、状态变化且探测需要付出时间与计算成本的环境中，系统如何联合决定“测试谁、测试什么、何时停止测试，以及把用户任务交给谁”，从而优化成功率、延迟、成本和鲁棒性？
 
 核心研究问题是：
-
+1
 > 在 Harness 内部结构不可见、Agent 状态动态变化、新 Agent 持续加入且执行可能失败的环境中，如何以较低的探索成本选择更可能成功的 Harness，并在执行失败时快速恢复？
 
 后续世界模型还需要进一步回答：
@@ -49,11 +52,9 @@ flowchart LR
     Controller --> Parser["TaskParser<br/>需求推断"]
     Parser --> Router["Router<br/>硬约束 + 加权评分"]
     Registry["Registry<br/>能力 · 硬件 · 心跳 · 负载"] -.-> Router
-    Router --> Pool["MicroVM Pool<br/>预热 · 租用 · 销毁 · 补池"]
-    Pool --> VM["CubeSandbox MicroVM"]
-    Controller -.-> Adapter["DSH Adapter<br/>注册 · 心跳 · 轮询"]
-    Adapter --> VM
-    VM --> Harness["DSH Harness<br/>插件 + 内部 Agent / Team"]
+    Controller -.-> Adapter["Local Adapter<br/>注册 · 心跳 · 轮询"]
+    Adapter --> Harness["本地 DSH Harness<br/>插件 + 内部 Agent / Team"]
+    Pool["可选 Sandbox Backend<br/>Mock / CubeSandbox"] -.-> Adapter
     Harness --> Result["统一结果 + 失败原因"]
     Result --> Controller
 ```
@@ -64,11 +65,11 @@ Controller 是控制面，负责：
 
 - 接收任务请求；
 - 调用 TaskParser 和 Router；
-- 创建任务租约并分配 MicroVM；
+- 创建任务租约并分发给本地 Harness；
 - 通过 Adapter 轮询分发任务；
 - 监控 Harness 心跳；
 - 处理超时、掉线、失败重试和重新路由；
-- 任务完成后销毁 MicroVM 并补充预热池；
+- 在启用沙箱后管理任务级创建、销毁与补池；
 - 管理后台 Canary 和新 Harness 准入状态。
 
 Controller 不决定 Harness 内部 Agent 如何分工，也不把内部 Agent 暴露给全局 Router。
@@ -88,13 +89,13 @@ Registry 当前使用 SQLite，记录：
 
 ### 3.3 DSH Harness 与 Adapter
 
-当前所有 ECS Harness 统一使用 DSH 作为运行接口。Adapter 将 Harness 注册到 Controller，并负责：
+当前本地实验使用 DSH 或零依赖 Mock Harness 作为运行接口。Adapter 将 Harness 注册到 Controller，并负责：
 
 - 注册与心跳；
 - 前台任务轮询；
 - 后台 Probe 轮询；
-- 连接 Controller 租用的 MicroVM；
-- 在 MicroVM 中执行 DSH；
+- 在各自独立的本地工作目录中调用 DSH；
+- 在可选沙箱模式下连接 Controller 租用的 MicroVM；
 - 回传统一结果、延迟、退出码和失败类型。
 
 Harness 内部可以只有一个 Agent，也可以包含多个 Agent 或自组织 Agent Team。全局只看到 Harness 的聚合能力。
@@ -117,14 +118,16 @@ Harness 内部可以只有一个 Agent，也可以包含多个 Agent 或自组�
 
 ### 4.1 TaskParser
 
-TaskParser 使用关键词规则从任务描述中推断：
+TaskParser 使用与公开路由政策 Prompt 对齐的确定性规则，从任务描述中推断：
 
 - `required_capabilities`；
 - `required_tools`；
 - `allowed_platforms`；
 - 是否需要 GPU；
 - 是否需要移动端；
-- 推断原因。
+- 网络、隐私、风险和并行性；
+- 延迟、成本、质量与成功率权重；
+- 否定表达、冲突警告和每项推断原因。
 
 例如“读取本地文件并生成报告”会推断出 `local_file_access` 和 `document_generation`；“使用手机摄像头拍照”会推断出 `mobile`、`camera` 和 `ios` 平台。
 
@@ -164,9 +167,9 @@ testing / background-only
     ↓
 后台 Canary Probe
     ↓
-从 MicroVM Pool 租用 MicroVM
+分配本地 Harness 工作目录
     ↓
-Adapter 在 CubeSandbox 中执行
+Adapter 使用 Mock 或本机 DSH 执行
     ↓
 成功：idle / foreground
 失败：重试或 degraded
@@ -191,7 +194,7 @@ Harness 发现 Agent
     ↓
 父 Harness 内部候选状态 testing
     ↓
-后台测试 / Trace Replay / Shadow Task
+后台 Canary / 合成 Probe / Shadow Task
     ↓
 候选 eligible
     ↓
@@ -202,31 +205,23 @@ Router 继续只选择父 Harness
 
 这样既保留了 Harness 内部的自主性，又避免未经验证的 Agent 直接进入前台。
 
-## 6. MicroVM 隔离与生命周期
+## 6. 本地执行与可选沙箱
 
-当前采用任务级一次性 MicroVM：
+默认实验直接在用户电脑上启动多个本地 Harness，每个 Harness 使用独立工作目录：
 
 ```text
-Controller 启动
-    ↓
-预热 READY MicroVM
-    ↓
-任务或后台 Probe 租用 MicroVM
-    ↓
-Adapter 使用 microvm_id 连接
-    ↓
-执行完成
-    ↓
-销毁本次 MicroVM
-    ↓
-创建新的 READY MicroVM 补池
+python3 local_runtime.py --engine mock/host
+    → 本地 Controller
+    → 五个能力不同的 Harness 进程
+    → 独立工作目录
+    → 本地任务级结果与失败原因
 ```
 
-任务不归还原 MicroVM，避免文件、进程、凭证和网络状态泄漏。
+`mock` 模式不需要 DSH 和模型凭证，用于功能回归与调度实验；`host` 模式调用本机 DSH，用于真实任务。两种模式都不依赖 ECS。它们提供进程与目录级隔离，但不构成处理不可信代码的硬件安全边界。
 
-本阶段已经修复后台 Probe 未携带 `microvm_id` 的问题。修复后，后台测试与前台任务使用相同的租用、销毁和补池语义；如果 MicroVM 暂时没有容量，Probe 会保持排队，不会被错误标记为执行失败。
+MicroVM Pool 和 CubeSandbox Backend 继续作为可选插件保留。启用后仍采用任务成功或失败后销毁、再补充全新预热实例的语义。
 
-## 7. ECS + CubeSandbox 实验现状
+## 7. 历史 ECS + CubeSandbox 验证
 
 ### 7.1 环境
 
@@ -269,7 +264,9 @@ Adapter 使用 microvm_id 连接
 
 后续新增 Harness 可以使用不同的插件声明、工具集合、延迟、负载和故障概率模拟异构环境。
 
-## 8. 当前测试结果
+该历史结果用于证明可插拔隔离后端可行，但不作为后续算法实验必须依赖的基础设施。
+
+## 8. 当前本地测试结果
 
 本地测试已经覆盖：
 
@@ -281,12 +278,16 @@ Adapter 使用 microvm_id 连接
 - 失败 Harness 重新连接后重新进入测试；
 - MicroVM 预热、租用、销毁、补池和逻辑跨节点快照；
 - HTTP API 的任务轮询和 Harness 发现。
+- 本地一键启动 Controller 与五个 Harness；
+- 零依赖 Mock 端到端任务提交、自动路由和结果返回；
+- DSH 黑箱执行 Prompt 与本机平台自动注册。
 
-当前验证结果：
+当前验证结果（2026 年 9 月 14 日）：
 
 ```text
-核心可靠性 / MicroVM / Router 测试：13/13 通过
+Router / Local Runtime / Reliability / Sandbox 测试：24/24 通过
 Controller HTTP 测试：2/2 通过
+本地五 Harness 端到端 Smoke Test：通过
 ```
 
 这些是功能回归测试，不是正式的性能或统计显著性实验。
@@ -303,15 +304,15 @@ Controller HTTP 测试：2/2 通过
 
 ### 9.3 没有主动选择测试信息
 
-当前后台测试由固定 Canary 触发，不会自动判断“测试 GPU、观察心跳、重放 Trace 或检查插件”哪个最有价值。
+当前后台测试由固定 Canary 触发，不会自动判断“测试 GPU、观察心跳或检查插件”哪个最有价值。
 
 ### 9.4 没有 Monte Carlo 或世界模型
 
 当前没有对不同调度方案进行未来状态模拟，也没有根据不确定性在探索新 Agent 与利用已知 Agent 之间进行优化。
 
-### 9.5 多节点实验仍有限
+### 9.5 本地实验规模仍有限
 
-逻辑节点可以验证调度语义，但单台 ECS 不能直接证明跨物理机迁移和多节点性能。
+单机多进程可以验证调度、探索和故障恢复算法，但不能直接证明跨物理机通信性能或硬件隔离强度。
 
 ## 10. 下一阶段研究方向
 
@@ -335,7 +336,7 @@ Controller HTTP 测试：2/2 通过
 
 ### 10.2 世界模型
 
-后续将使用任务特征、Harness 状态、历史 Trace 和执行结果训练预测模型，预测：
+后续将使用任务特征、Harness 可观测状态和任务级执行结果训练预测模型。每个 Harness 都是黑箱，不要求上传内部 Agent、思维链、工具调用轨迹、本地模型参数或私有数据。模型预测：
 
 - 任务成功概率；
 - 延迟和尾部延迟；
@@ -360,7 +361,7 @@ Controller HTTP 测试：2/2 通过
 更新预测模型和候选池
 ```
 
-这可以形式化为 Value of Information，并与后台 Canary、Trace Replay 和 Shadow Task 结合。
+这可以形式化为 Value of Information，并与后台 Canary、合成 Probe 和 Shadow Task 结合。
 
 ### 10.4 主备 Agent Team
 
@@ -368,27 +369,27 @@ Controller HTTP 测试：2/2 通过
 
 ## 11. 建议实验路线
 
-1. 完成五个 DSH Harness 的稳定接入；
+1. 在本机完成五个 DSH Harness 的稳定接入；
 2. 对每个 Harness 注入可控延迟、负载、掉线和成功率；
-3. 建立脱敏 Trace Store 和一致性哈希 Replay；
+3. 建立不含内部轨迹的任务级 Outcome Store 和标准化 Probe Suite；
 4. 对比静态能力路由、负载感知路由、历史统计路由和 Monte Carlo Rollout；
-5. 比较立即准入、随机 Canary、Trace Replay 和组合准入；
+5. 比较立即准入、随机 Canary、合成 Probe 和组合准入；
 6. 训练离线成功率、延迟和风险预测模型；
 7. 加入主动信息获取策略；
 8. 最后加入选择性主备 Team 和故障接管实验。
 
 ## 12. 阶段性结论
 
-当前项目已经从早期 Mac/iPhone 概念验证发展为一个基于 DSH Harness、ECS 和 CubeSandbox 的动态异构 Agent 调度原型。系统目前最重要的成果不是已经实现世界模型，而是建立了一个能够承载后续研究的真实执行闭环：
+当前项目已经从早期 Mac/iPhone 和 ECS/CubeSandbox 验证发展为一个可以在普通用户电脑上运行的黑箱异构 Harness 调度原型。系统目前最重要的成果不是已经实现世界模型，而是建立了一个不依赖云基础设施、能够承载后续研究的执行闭环：
 
 ```text
 自动需求解析
 → Harness 选择
-→ MicroVM 隔离执行
+→ 本地黑箱 Harness 执行
 → 前后台准入
 → 心跳与租约
 → 失败重试
-→ MicroVM 销毁与补池
+→ 任务级结果与失败报告
 ```
 
 后续研究应以当前确定性 Router 作为 Baseline，逐步引入 Monte Carlo、世界模型、主动信息获取和主备容错，并通过严格对比实验验证每个模块的实际收益。

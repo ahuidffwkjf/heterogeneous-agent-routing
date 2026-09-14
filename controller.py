@@ -1,4 +1,4 @@
-"""Controller for the DSH + MicroVM experiment.
+"""Controller for the local-first FedHarness experiment.
 
 The Controller owns task state and the execution-unit registry. The Router
 only makes a routing decision from the latest registry snapshot. Agents can
@@ -107,6 +107,7 @@ class Job:
     microvm_profile: str | None = None
     microvm_node_id: str | None = None
     microvm_runtime_version: str | None = None
+    routing_decision: dict[str, Any] | None = None
 
 
 @dataclass
@@ -174,6 +175,7 @@ class PhaseOneController:
             payload.setdefault("microvm_profile", None)
             payload.setdefault("microvm_node_id", None)
             payload.setdefault("microvm_runtime_version", None)
+            payload.setdefault("routing_decision", None)
             self.jobs[payload["job_id"]] = Job(**payload)
         self.poll_queues: dict[str, queue.Queue[str]] = {}
         self.background_queues: dict[str, queue.Queue[str]] = {}
@@ -759,11 +761,19 @@ class PhaseOneController:
         stored_task = dict(task_data)
         stored_task["inferred_requirements"] = {
             "required_capabilities": sorted(inferred["required_capabilities"]),
+            "preferred_capabilities": sorted(inferred["preferred_capabilities"]),
             "required_tools": sorted(inferred["required_tools"]),
             "allowed_platforms": sorted(inferred["allowed_platforms"]),
+            "preferred_platforms": sorted(inferred["preferred_platforms"]),
             "requires_gpu": inferred["requires_gpu"],
             "requires_mobile": inferred["requires_mobile"],
+            "needs_network": inferred["needs_network"],
+            "privacy_level": inferred["privacy_level"],
+            "risk_level": inferred["risk_level"],
+            "parallelizable": inferred["parallelizable"],
+            "objective_weights": inferred["objective_weights"],
             "reasons": inferred["reasons"],
+            "warnings": inferred["warnings"],
         }
         job = Job(
             job_id=uuid.uuid4().hex[:12],
@@ -774,6 +784,7 @@ class PhaseOneController:
             max_retries=max(0, int(task_data.get("max_retries", self.default_max_retries))),
             retryable=bool(task_data.get("retryable", True)),
             lease_id=uuid.uuid4().hex,
+            routing_decision=decision.to_dict(),
         )
         with self.lock:
             self.jobs[job.job_id] = job
@@ -1204,7 +1215,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            self._json({"status": "ok", "service": "phase1-controller"})
+            self._json({"status": "ok", "service": "fedharness-controller"})
             return
         if parsed.path in ("/units", "/registry/units"):
             if parsed.path == "/registry/units" and not self._require_registry_token():
@@ -1394,7 +1405,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global CONTROLLER
-    parser = argparse.ArgumentParser(description="DSH Harness + MicroVM controller")
+    parser = argparse.ArgumentParser(description="Local-first FedHarness controller")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--registry", default=str(DEFAULT_REGISTRY))
@@ -1412,7 +1423,7 @@ def main() -> None:
         "--microvm-backend",
         choices=("mock", "cubesandbox"),
         default=os.environ.get("MICROVM_BACKEND", "mock"),
-        help="MicroVM implementation: mock for tests or cubesandbox for ECS",
+        help="Sandbox control-plane backend: local mock (default) or optional CubeSandbox",
     )
     parser.add_argument(
         "--cube-api-url",
@@ -1516,7 +1527,7 @@ def main() -> None:
         microvm_backend,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"DSH controller listening on http://{args.host}:{args.port}")
+    print(f"FedHarness controller listening on http://{args.host}:{args.port}")
     print(f"Registry token: {CONTROLLER.registry_token}")
     try:
         server.serve_forever()
